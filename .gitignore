@@ -9,6 +9,7 @@ __pycache__
 .idea/**/usage.statistics.xml
 .idea/**/dictionaries
 .idea/**/shelf
+spinnaker_python-4.1.0.172-cp310-cp310-macosx_13_0_arm64
 
 # Generated files
 .idea/**/contentModel.xml
