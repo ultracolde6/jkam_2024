@@ -111,6 +111,7 @@ class Ui_CameraWindow(object):
     def retranslateUi(self, CameraWindow):
         _translate = QtCore.QCoreApplication.translate
         CameraWindow.setWindowTitle(_translate("CameraWindow", "jkam"))
+
 from package.analyzers.gaussianfitanalyzer import GaussianFitAnalyzer
 from package.analyzers.roiintegrationanalyzer import RoiIntegrationAnalyzer
 from package.widgets.absorption_view_widget import AbsorptionViewWidget

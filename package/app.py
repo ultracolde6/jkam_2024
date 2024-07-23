@@ -2,7 +2,7 @@ import sys
 import ctypes
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
-from package.widgets.jkam_window import JKamWindow
+from jkam_window import JKamWindow
 
 
 def run():
