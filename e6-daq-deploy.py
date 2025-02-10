@@ -1,11 +1,12 @@
 import sys
 import time
 import os
+import warnings
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QWidget, QTabWidget, QGridLayout, QHeaderView,
-    QLabel, QHBoxLayout, QLineEdit, QDockWidget, QCheckBox
+    QLabel, QHBoxLayout, QLineEdit, QDockWidget, QCheckBox, QComboBox
 )
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -55,6 +56,12 @@ class JkamH5FileHandler:
         self.LO_rate = 0
         self.photonrate_conversion = 0
 
+        # Window‐function choice (default 'hann')
+        self.window = "hann"
+        
+        # *** NEW: add avg_time_gap attribute for acceptance in downstream handlers ***
+        self.avg_time_gap = 0
+
     def update_settings(self):
         """ Pull the current GUI settings into local variables. """
         self.time_me = self.gui.time_me_checkbox.isChecked()
@@ -71,6 +78,9 @@ class JkamH5FileHandler:
         self.PHOTON_ENERGY = float(self.gui.PHOTON_ENERGY_input.text())
         self.LO_rate = float(self.gui.LO_rate_input.text())
         self.photonrate_conversion = float(self.gui.photonrate_conversion_input.text())
+
+        # Window selection
+        self.window = self.gui.window_select.currentText()
 
     def process_file(self, file):
         """
@@ -130,6 +140,9 @@ class JkamH5FileHandler:
             self.last_passed_idx = self.shots_num
         self.shots_num += 1
         self.all_datapoints.append(file_ctime)
+        
+        # *** NEW: update the avg_time_gap attribute so that other file handlers can use it ***
+        self.avg_time_gap = jkam_avg_time_gap
 
         # Update main JKAM table
         row_position = self.gui.table.rowCount()
@@ -196,7 +209,7 @@ class JkamH5FileHandler:
         ch1_pure_vec = np.exp(-1j * 2 * np.pi * self.dds_freq * t_vec)
         ch3_pure_vec = np.exp(-1j * 2 * np.pi * self.het_freq * t_vec)
 
-        # Generate a list of "start times" in samples. They might be floats, so we'll handle that carefully.
+        # Generate a list of "start times" in samples
         t0_list = np.arange(0, chlen / self.samp_freq - self.filter_time + self.step_time, self.step_time)
         timebin_array = np.empty((len(t0_list), 2), dtype=float)
         timebin_array[:, 0] = t0_list
@@ -205,8 +218,8 @@ class JkamH5FileHandler:
         num_segments = 3
         cmplx_amp_array = np.empty((2, num_shots_gage, num_segments, len(t0_list)), dtype=np.cdouble)
 
-        # We'll keep 't0_list' as float to define the time boundaries, but we convert to int for array slicing.
-        window = 'hann'
+        # Window
+        window_function = self.window
 
         for shot_num in range(len(self.jkam_creation_time_array)):
             if (self.gui.gage_h5_file_handler.mask_valid_data is not None and
@@ -227,7 +240,6 @@ class JkamH5FileHandler:
                     cmplx_amp_list_ch3 = t0_list * 0j
 
                     for i, t0_f in enumerate(t0_list):
-                        # Convert float index -> int index
                         t0_i = int(round(t0_f * self.samp_freq))
                         t1_i = t0_i + int(round(self.filter_time * self.samp_freq))
 
@@ -237,17 +249,16 @@ class JkamH5FileHandler:
                             cmplx_amp_list_ch3[i] = np.nan
                             continue
 
-                        if window == 'flattop':
+                        if window_function == 'flattop':
                             w = signal.windows.flattop(length)
-                        elif window == 'square':
+                        elif window_function == 'square':
                             w = 1
-                        else:
-                            # default 'hann'
+                        else:  # default 'hann'
                             w = signal.windows.hann(length) * 2
 
                         ch1_segment = ch1[t0_i:t1_i]
                         ch3_segment = ch3[t0_i:t1_i]
-                        # Multiply by window and demod wave
+
                         ch1_demod = ch1_segment * w * ch1_pure_vec[t0_i:t1_i]
                         ch3_demod = ch3_segment * w * ch3_pure_vec[t0_i:t1_i]
 
@@ -264,7 +275,7 @@ class JkamH5FileHandler:
                 if shot_num < cmplx_amp_array.shape[1]:
                     cmplx_amp_array[:, shot_num, :, :] = np.nan
 
-        #save results
+        # Save results
         try:
             with open(
                 f'C:\\Users\\jayom\\Downloads\\fft_gage_cmplx_amp_{self.filter_time}_{self.step_time}.pkl', 'wb'
@@ -278,7 +289,7 @@ class JkamH5FileHandler:
         except Exception as e:
             print("Could not save FFT results to pickle:", e)
 
-        # plot something on figure[4]
+        # Plot something on figure[4]
         fig_fft = self.gui.figures[4]
         fig_fft.clear()
         ax = fig_fft.add_subplot(111)
@@ -295,7 +306,6 @@ class JkamH5FileHandler:
                     ha='center', va='center', transform=ax.transAxes)
         else:
             last_shot = valid_shots[-1]
-            # Plot CH1 magnitude from segment 0
             ch1_magnitude = np.abs(cmplx_amp_array[0, last_shot, 0, :])
             ax.plot(ch1_magnitude, label=f"Shot {last_shot}, CH1 seg0 (magnitude)")
             ax.set_title("FFT Magnitude (Segment 0, last valid shot)")
@@ -324,6 +334,9 @@ class BinFileHandler:
         self.final_accepted = []
         self.start_time = None
         self.avg_time_gap = 0
+
+        # Track which shot indexes we've already printed "FPGA error at shot X" for
+        self.fpga_error_shots_reported = set()
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
@@ -426,7 +439,10 @@ class BinFileHandler:
                     else:
                         self.mask_valid_data[shot_num] = False
                         self.color_array[shot_num] = "r"
-                        print(f"FPGA error at shot {shot_num}")
+                        # Only print the error once per shot
+                        if shot_num not in self.fpga_error_shots_reported:
+                            print(f"FPGA error at shot {shot_num}")
+                            self.fpga_error_shots_reported.add(shot_num)
             else:
                 self.mask_valid_data[shot_num] = False
                 self.jkam_fpga_matchlist[shot_num] = -1
@@ -479,6 +495,9 @@ class GageScopeH5FileHandler:
         self.final_accepted = []
         self.start_time = None
         self.avg_time_gap = 0
+
+        # Track which shot indexes we've already printed "Gage error at shot X" for
+        self.gage_error_shots_reported = set()
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
@@ -597,7 +616,9 @@ class GageScopeH5FileHandler:
                         else:
                             self.mask_valid_data[shot_num] = False
                             self.color_array[shot_num] = "r"
-                            print(f"Gage error at shot {shot_num}")
+                            if shot_num not in self.gage_error_shots_reported:
+                                print(f"Gage error at shot {shot_num}")
+                                self.gage_error_shots_reported.add(shot_num)
                 else:
                     self.mask_valid_data[shot_num] = False
                     self.color_array[shot_num] = "r"
@@ -666,7 +687,16 @@ class RedPitayaFileHandler:
             return
 
         try:
-            filename_phase = np.loadtxt(file, dtype=float, delimiter=',')
+            # Turn UserWarning into an exception to detect empty files
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                filename_phase = np.loadtxt(file, dtype=float, delimiter=',')
+        except UserWarning:
+            print(f"Error: Red Pitaya file is empty: {file}")
+            self.rp_files.append(file)
+            self.rp_times_list.append(None)
+            self.rerun_acceptance_rp()
+            return
         except Exception as e:
             print(f"Failed to load Red Pitaya file {file}: {e}")
             self.rp_files.append(file)
@@ -905,6 +935,14 @@ class FileProcessorGUI(QMainWindow):
         self.feature_options_layout.addWidget(self.photonrate_conversion_label)
         self.feature_options_layout.addWidget(self.photonrate_conversion_input)
 
+        # Window function selector
+        self.window_select_label = QLabel("Window function:")
+        self.window_select = QComboBox()
+        self.window_select.addItems(["hann", "flattop", "square"])
+        self.window_select.setCurrentIndex(0)  # default = hann
+        self.feature_options_layout.addWidget(self.window_select_label)
+        self.feature_options_layout.addWidget(self.window_select)
+
         # Accept Inputs
         self.accept_button = QPushButton("Accept Inputs")
         self.accept_button.clicked.connect(self.accept_inputs)
@@ -1128,6 +1166,11 @@ class FileProcessorGUI(QMainWindow):
         print("Stream stopped.")
 
     def check_for_new_files(self):
+        """
+        Recursively checks subfolders (RedPitaya, PhotonTimer, High NA Imaging, gage, etc.)
+        The acceptance logic for JKAM, GageScope, FPGA, or RedPitaya remains unchanged;
+        only how we scan for new files is adjusted.
+        """
         if not self.inputs_accepted:
             return
 
@@ -1136,12 +1179,24 @@ class FileProcessorGUI(QMainWindow):
             print(f"Invalid stream directory: {watch_dir}")
             return
 
-        all_files = [os.path.join(watch_dir, f) for f in os.listdir(watch_dir)]
-        all_files = [f for f in all_files if os.path.isfile(f)]
-        new_files = [f for f in all_files if f not in self.stream_processed_files]
-        for nf in new_files:
-            self.process_one_file(nf)
-            self.stream_processed_files.add(nf)
+        # Look into each subfolder in watch_dir
+        subfolders = sorted(
+            d for d in os.listdir(watch_dir)
+            if os.path.isdir(os.path.join(watch_dir, d))
+        )
+
+        for subfolder in subfolders:
+            subfolder_path = os.path.join(watch_dir, subfolder)
+            folder_files = sorted(
+                os.path.join(subfolder_path, f)
+                for f in os.listdir(subfolder_path)
+                if os.path.isfile(os.path.join(subfolder_path, f))
+            )
+
+            new_files = [f for f in folder_files if f not in self.stream_processed_files]
+            for nf in new_files:
+                self.process_one_file(nf)
+                self.stream_processed_files.add(nf)
 
     def closeEvent(self, event):
         """Clean up resources before closing."""
