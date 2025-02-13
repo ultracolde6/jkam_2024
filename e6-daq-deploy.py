@@ -1,3 +1,5 @@
+#UPDATED 2/12 MOST ADVANCED ONE YET WITH RED PITAYA GRAPHING
+
 import sys
 import time
 import os
@@ -520,7 +522,6 @@ class GageScopeH5FileHandler:
                 for frame in range(3):
                     ch1_data[f'CH1_frame{frame}'] = np.array(h5_file[f'CH1_frame{frame}'])
                     ch3_data[f'CH3_frame{frame}'] = np.array(h5_file[f'CH3_frame{frame}'])
-
             self.gage_files.append({'CH1': ch1_data, 'CH3': ch3_data})
             self.gage_creation_time_array.append(file_ctime)
 
@@ -676,6 +677,33 @@ class RedPitayaFileHandler:
         self.cumulative_data = []
         self.final_accepted = []
 
+        self.cav_contrast = None
+        self.perp_contrast = None
+        self.cav_hist = None
+        self.perp_hist = None
+        self.cav_len = None
+        self.perp_len = None
+        self.cav_output = None
+        self.perp_output = None
+        self.cav_phase = None
+        self.perp_phase = None
+
+        self.done1 = 0
+        self.done2 = 0
+        self.done3 = 0
+        self.done4 = 0
+
+    def load_data(self, file):
+        """ Helper to load data and ensure it is 2D. """
+        try:
+            data = np.loadtxt(file, dtype=float, delimiter=',')
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            return data
+        except Exception as e:
+            print(f"Error loading {file}: {e}")
+            return None
+
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
 
@@ -710,7 +738,7 @@ class RedPitayaFileHandler:
             self.rp_times_list.append(None)
             self.rerun_acceptance_rp()
             return
-
+        
         if len(filename_phase.shape) == 1:
             filename_phase = filename_phase.reshape(1, -1)
 
@@ -744,7 +772,30 @@ class RedPitayaFileHandler:
         )
         self.gui.additional_table_3.setItem(row_position, 4, QTableWidgetItem(info_str))
 
+        # Load additional Red Pitaya files based on filename substrings
+        if 'cnstcav' in file:
+            self.cav_contrast = self.load_data(file)
+        if 'cnstperp' in file:
+            self.perp_contrast = self.load_data(file)
+        if 'histcav' in file:
+            self.cav_hist = self.load_data(file)
+        if 'histperp' in file:
+            self.perp_hist = self.load_data(file)
+        if 'lencav' in file:
+            self.cav_len = self.load_data(file)
+        if 'lenperp' in file:
+            self.perp_len = self.load_data(file)
+        if 'outcav' in file:
+            self.cav_output = self.load_data(file)
+        if 'outperp' in file:
+            self.perp_output = self.load_data(file)
+        if 'phicav' in file:
+            self.cav_phase = self.load_data(file)
+        if 'phiperp' in file:
+            self.perp_phase = self.load_data(file)
+
         self.update_chart_rp()
+        self.update_unique_rp()
 
     def rerun_acceptance_rp(self):
         num_shots = len(self.rp_files)
@@ -835,6 +886,72 @@ class RedPitayaFileHandler:
         ax.set_xlabel("Shot Number")
         ax.set_ylabel("Cumulative Value")
         self.gui.canvases[2].draw()
+
+    def update_unique_rp(self):
+        # Graph 5: cav_len and perp_len
+        if self.done1 == 0 and self.cav_len is not None and self.perp_len is not None:
+            if self.cav_len.ndim == 2 and self.cav_len.shape[1] >= 2 and \
+               self.perp_len.ndim == 2 and self.perp_len.shape[1] >= 2:
+                self.done1 = 1
+                fig = self.gui.figures[5]
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.plot(self.cav_len[:, 0], self.cav_len[:, 1], label="cav_len(locked)")
+                ax.plot(self.perp_len[:, 0], self.perp_len[:, 1], label="perp_len(locked)")
+                ax.legend()
+                self.gui.canvases[5].draw()
+            else:
+                print("Invalid data shape for lencav or lenperp. Skipping graph 5.")
+
+        # Graph 6: cav_contrast and perp_contrast
+        if self.done2 == 0 and self.cav_contrast is not None and self.perp_contrast is not None:
+            if self.cav_contrast.ndim == 2 and self.cav_contrast.shape[1] >= 2 and \
+               self.perp_contrast.ndim == 2 and self.perp_contrast.shape[1] >= 2:
+                self.done2 = 1
+                fig = self.gui.figures[6]
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.plot(self.cav_contrast[:, 0], self.cav_contrast[:, 1], label="cav_contrast")
+                ax.plot(self.perp_contrast[:, 0], self.perp_contrast[:, 1], label="perp_contrast")
+                ax.legend()
+                self.gui.canvases[6].draw()
+            else:
+                print("Invalid data shape for cav_contrast or perp_contrast. Skipping graph 6.")
+
+        # Graph 7: cav_output and perp_output
+        if self.done3 == 0 and self.cav_output is not None and self.perp_output is not None:
+            if self.cav_output.ndim == 2 and self.cav_output.shape[1] >= 2 and \
+               self.perp_output.ndim == 2 and self.perp_output.shape[1] >= 2:
+                self.done3 = 1
+                fig = self.gui.figures[7]
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.plot(self.cav_output[:, 0], self.cav_output[:, 1], label="cav_output")
+                ax.plot(self.perp_output[:, 0], self.perp_output[:, 1], label="perp_output")
+                ax.set_ylim(-1.2, 1.2)
+                ax.legend()
+                self.gui.canvases[7].draw()
+            else:
+                print("Invalid data shape for cav_output or perp_output. Skipping graph 7.")
+
+        # Graph 8: cav_phase and perp_phase
+        num_shot_start = 0
+        if self.done4 == 0 and self.cav_phase is not None and self.perp_phase is not None:
+            if self.cav_phase.ndim == 2 and self.cav_phase.shape[1] >= 2 and \
+               self.perp_phase.ndim == 2 and self.perp_phase.shape[1] >= 2:
+                self.done4 = 1
+                fig = self.gui.figures[8]
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.plot(self.cav_phase[:, 0], self.cav_phase[:, 1], label="cav_phase")
+                ax.plot(self.perp_phase[:, 0], self.perp_phase[:, 1], label="perp_phase")
+                ax.axhline(0.11, c='k')
+                ax.axhline(-0.11, c='k')
+                ax.axvline(self.cav_phase[num_shot_start, 0], c='k')
+                ax.legend()
+                self.gui.canvases[8].draw()
+            else:
+                print("Invalid data shape for cav_phase or perp_phase. Skipping graph 8.")
 
 
 ###############################################################################
@@ -994,6 +1111,11 @@ class FileProcessorGUI(QMainWindow):
         self.fft_tab_layout = QVBoxLayout(self.fft_tab)
         self.tabs.addTab(self.fft_tab, "FFT Graph")
 
+        # Red Pitaya Visualizations Tab
+        self.rp_tab = QWidget()
+        self.rp_tab_layout = QGridLayout(self.rp_tab)
+        self.tabs.addTab(self.rp_tab, "Red Pitaya Graphs")
+
         # JKAM table
         self.table = QTableWidget()
         self.table.setColumnCount(4)
@@ -1037,8 +1159,8 @@ class FileProcessorGUI(QMainWindow):
         self.additional_table_3.horizontalHeader().setStretchLastSection(True)
         self.additional_table_tab_3_layout.addWidget(self.additional_table_3)
 
-        # Set up 5 figures
-        self.figures = [Figure() for _ in range(5)]
+        # Set up 9 figures
+        self.figures = [Figure() for _ in range(9)]
         self.canvases = [FigureCanvas(fig) for fig in self.figures]
 
         # Place 4 figures (charts) in a 2x2 layout
@@ -1055,12 +1177,23 @@ class FileProcessorGUI(QMainWindow):
         # The FFT chart is figure[4]
         self.fft_tab_layout.addWidget(self.canvases[4])
 
+        # Red pitaya 4 graphs setup
+        self.rp_tab_layout.addWidget(self.canvases[5], 0, 0)
+        self.rp_tab_layout.addWidget(self.canvases[6], 0, 1)
+        self.rp_tab_layout.addWidget(self.canvases[7], 1, 0)
+        self.rp_tab_layout.addWidget(self.canvases[8], 1, 1)
+
         # Initialize subplots
         self.initialize_plot(0, "Cumulative Accepted Files 1 (JKAM)")
         self.initialize_plot(1, "Cumulative Accepted Files 2 (Bin/FPGA)")
         self.initialize_plot(2, "Cumulative Accepted Files (Red Pitaya)")
         self.initialize_plot(3, "Cumulative Accepted Files 3 (GageScope)")
         self.initialize_fft_plot(4)
+
+        self.initialize_rp_plot(5)
+        self.initialize_rp_plot(6)
+        self.initialize_rp_plot(7)
+        self.initialize_rp_plot(8)
 
         # Streaming Controls
         self.stream_controls_layout = QHBoxLayout()
@@ -1108,6 +1241,12 @@ class FileProcessorGUI(QMainWindow):
         ax.set_title(title_str)
         ax.set_xlabel("Shot Number")
         ax.set_ylabel("Cumulative Value")
+        self.canvases[index].draw()
+
+    def initialize_rp_plot(self, index):
+        ax = self.figures[index].add_subplot(111)
+        ax.plot([], [])
+        ax.set_title("Cav & Perp Phase Locks")
         self.canvases[index].draw()
 
     def initialize_fft_plot(self, index):
@@ -1168,7 +1307,7 @@ class FileProcessorGUI(QMainWindow):
     def check_for_new_files(self):
         """
         Recursively checks subfolders (RedPitaya, PhotonTimer, High NA Imaging, gage, etc.)
-        The acceptance logic for JKAM, GageScope, FPGA, or RedPitaya remains unchanged;
+        The acceptance logic for JKAM, GageScope, FPGA, or Red Pitaya remains unchanged;
         only how we scan for new files is adjusted.
         """
         if not self.inputs_accepted:
