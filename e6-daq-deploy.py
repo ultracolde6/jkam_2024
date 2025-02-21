@@ -1,4 +1,4 @@
-#UPDATED 2/12 MOST ADVANCED ONE YET WITH RED PITAYA GRAPHING
+#TRYNA DO IT ON 2/19
 
 import sys
 import time
@@ -336,9 +336,49 @@ class BinFileHandler:
         self.final_accepted = []
         self.start_time = None
         self.avg_time_gap = 0
+        # For FPGA graphing, we only store the essential timestamp data.
+        self.PT_cavity_timestamp_array_raw = []
 
         # Track which shot indexes we've already printed "FPGA error at shot X" for
         self.fpga_error_shots_reported = set()
+
+    def update_fpga_graph(self, filename):
+        unit_time_PT = 1/700  # in microseconds
+
+        # Read the binary file and unpack bits
+        raw_data = np.fromfile(filename, dtype=np.uint8)
+        bin_data = np.unpackbits(raw_data)
+        # Reshape into events of 32 bits each
+        events = bin_data.reshape(-1, 32)
+        # Pre-calculate weights for the first 25 bits (time portion)
+        tparts = np.concatenate((np.flip(2**np.arange(8)),
+                                 np.flip(2**np.arange(8,16)),
+                                 np.flip(2**np.arange(16,24)),
+                                 [16777216]))
+        # Vectorized dot product to compute timestamps for each event
+        timestamps = events[:, :25].dot(tparts)
+        # Sort and convert to time units
+        timestamps = unit_time_PT * np.sort(timestamps)
+
+        # Store the timestamps for this shot
+        self.PT_cavity_timestamp_array_raw.append(timestamps)
+
+        # Plot the FPGA atom input times using a stem plot
+        fig = self.gui.figures[9]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        if timestamps.size == 0:
+            ax.text(0.5, 0.5, "No FPGA timestamps", ha='center', va='center', transform=ax.transAxes)
+        else:
+            ax.stem(timestamps, np.ones_like(timestamps), linefmt='b-', markerfmt='bo', basefmt=" ")
+        ax.set_title("FPGA Atom Input Times")
+        ax.set_xlabel("Time (us)")
+        ax.set_ylabel("Atoms In (Y/N)")
+        self.gui.canvases[9].draw()
+
+
+
+    # The old process_timer_py is removed in favor of the vectorized update_fpga_graph.
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
@@ -385,6 +425,7 @@ class BinFileHandler:
         )
         self.gui.additional_table_1.setItem(row_position, 4, QTableWidgetItem(summary_text))
 
+        self.update_fpga_graph(file)
         self.update_chart_2()
 
     def rerun_acceptance(self):
@@ -441,7 +482,6 @@ class BinFileHandler:
                     else:
                         self.mask_valid_data[shot_num] = False
                         self.color_array[shot_num] = "r"
-                        # Only print the error once per shot
                         if shot_num not in self.fpga_error_shots_reported:
                             print(f"FPGA error at shot {shot_num}")
                             self.fpga_error_shots_reported.add(shot_num)
@@ -510,11 +550,9 @@ class GageScopeH5FileHandler:
             print(f"Error accessing file time for {file}: {e}")
             return
 
-        # Check if we've already processed this ctime
         if file_ctime in self.gage_creation_time_array:
             return
 
-        # Extract data
         try:
             with h5py.File(file, 'r') as h5_file:
                 ch1_data = {}
@@ -528,7 +566,6 @@ class GageScopeH5FileHandler:
             if len(self.gage_creation_time_array) == 1:
                 self.start_time = file_ctime
 
-            # Re-run acceptance
             self.rerun_acceptance_gage()
 
             new_shot_index = len(self.gage_creation_time_array) - 1
@@ -542,7 +579,6 @@ class GageScopeH5FileHandler:
             if new_shot_index in jkam_space_dict:
                 jkam_space_correct_str = str(jkam_space_dict[new_shot_index])
 
-            # Add row to GageScope table
             row_position = self.gui.additional_table_2.rowCount()
             self.gui.additional_table_2.insertRow(row_position)
             self.gui.additional_table_2.setItem(row_position, 0, QTableWidgetItem(str(new_shot_index)))
@@ -559,7 +595,6 @@ class GageScopeH5FileHandler:
 
             self.update_chart_3()
 
-            # Let JKAM code know we have another shot time
             self.gui.jkam_h5_file_handler.all_datapoints.append(file_ctime)
             self.gui.jkam_h5_file_handler.update_fft_plot()
 
@@ -627,7 +662,6 @@ class GageScopeH5FileHandler:
                 self.mask_valid_data[shot_num] = False
                 self.jkam_gage_matchlist[shot_num] = -1
 
-        # Recompute cumulative data
         self.cumulative_data = []
         last_success_count = 0
         highest_count = 0
@@ -715,7 +749,6 @@ class RedPitayaFileHandler:
             return
 
         try:
-            # Turn UserWarning into an exception to detect empty files
             with warnings.catch_warnings():
                 warnings.simplefilter("error", UserWarning)
                 filename_phase = np.loadtxt(file, dtype=float, delimiter=',')
@@ -772,7 +805,6 @@ class RedPitayaFileHandler:
         )
         self.gui.additional_table_3.setItem(row_position, 4, QTableWidgetItem(info_str))
 
-        # Load additional Red Pitaya files based on filename substrings
         if 'cnstcav' in file:
             self.cav_contrast = self.load_data(file)
         if 'cnstperp' in file:
@@ -888,7 +920,6 @@ class RedPitayaFileHandler:
         self.gui.canvases[2].draw()
 
     def update_unique_rp(self):
-        # Graph 5: cav_len and perp_len
         if self.done1 == 0 and self.cav_len is not None and self.perp_len is not None:
             if self.cav_len.ndim == 2 and self.cav_len.shape[1] >= 2 and \
                self.perp_len.ndim == 2 and self.perp_len.shape[1] >= 2:
@@ -903,7 +934,6 @@ class RedPitayaFileHandler:
             else:
                 print("Invalid data shape for lencav or lenperp. Skipping graph 5.")
 
-        # Graph 6: cav_contrast and perp_contrast
         if self.done2 == 0 and self.cav_contrast is not None and self.perp_contrast is not None:
             if self.cav_contrast.ndim == 2 and self.cav_contrast.shape[1] >= 2 and \
                self.perp_contrast.ndim == 2 and self.perp_contrast.shape[1] >= 2:
@@ -918,7 +948,6 @@ class RedPitayaFileHandler:
             else:
                 print("Invalid data shape for cav_contrast or perp_contrast. Skipping graph 6.")
 
-        # Graph 7: cav_output and perp_output
         if self.done3 == 0 and self.cav_output is not None and self.perp_output is not None:
             if self.cav_output.ndim == 2 and self.cav_output.shape[1] >= 2 and \
                self.perp_output.ndim == 2 and self.perp_output.shape[1] >= 2:
@@ -934,7 +963,6 @@ class RedPitayaFileHandler:
             else:
                 print("Invalid data shape for cav_output or perp_output. Skipping graph 7.")
 
-        # Graph 8: cav_phase and perp_phase
         num_shot_start = 0
         if self.done4 == 0 and self.cav_phase is not None and self.perp_phase is not None:
             if self.cav_phase.ndim == 2 and self.cav_phase.shape[1] >= 2 and \
@@ -1056,7 +1084,7 @@ class FileProcessorGUI(QMainWindow):
         self.window_select_label = QLabel("Window function:")
         self.window_select = QComboBox()
         self.window_select.addItems(["hann", "flattop", "square"])
-        self.window_select.setCurrentIndex(0)  # default = hann
+        self.window_select.setCurrentIndex(0)
         self.feature_options_layout.addWidget(self.window_select_label)
         self.feature_options_layout.addWidget(self.window_select)
 
@@ -1084,27 +1112,27 @@ class FileProcessorGUI(QMainWindow):
         # Chart tab
         self.chart_tab = QWidget()
         self.chart_layout = QGridLayout(self.chart_tab)
-        self.tabs.addTab(self.chart_tab, "Charts")
+        self.tabs.addTab(self.chart_tab, "Accept Charts")
 
         # JKAM table tab
         self.table_tab = QWidget()
         self.table_layout = QVBoxLayout(self.table_tab)
-        self.tabs.addTab(self.table_tab, "JKAM Data Table")
+        self.tabs.addTab(self.table_tab, "JKAM Data")
 
         # FPGA table tab
         self.additional_table_tab_1 = QWidget()
         self.additional_table_tab_1_layout = QVBoxLayout(self.additional_table_tab_1)
-        self.tabs.addTab(self.additional_table_tab_1, "Additional Table 1 (FPGA)")
+        self.tabs.addTab(self.additional_table_tab_1, "FPGA Data")
 
         # GageScope table tab
         self.additional_table_tab_2 = QWidget()
         self.additional_table_tab_2_layout = QVBoxLayout(self.additional_table_tab_2)
-        self.tabs.addTab(self.additional_table_tab_2, "Additional Table 2 (GageScope)")
+        self.tabs.addTab(self.additional_table_tab_2, "GageScope Data")
 
         # Red Pitaya table tab
         self.additional_table_tab_3 = QWidget()
         self.additional_table_tab_3_layout = QVBoxLayout(self.additional_table_tab_3)
-        self.tabs.addTab(self.additional_table_tab_3, "Additional Table 3 (Red Pitaya)")
+        self.tabs.addTab(self.additional_table_tab_3, "Red Pitaya Data")
 
         # FFT Graph tab
         self.fft_tab = QWidget()
@@ -1115,6 +1143,11 @@ class FileProcessorGUI(QMainWindow):
         self.rp_tab = QWidget()
         self.rp_tab_layout = QGridLayout(self.rp_tab)
         self.tabs.addTab(self.rp_tab, "Red Pitaya Graphs")
+
+        #FPGA Visualizations Tab
+        self.fpga_tab = QWidget()
+        self.fpga_tab_layout = QVBoxLayout(self.fpga_tab)
+        self.tabs.addTab(self.fpga_tab, "FPGA Graphs")
 
         # JKAM table
         self.table = QTableWidget()
@@ -1160,30 +1193,27 @@ class FileProcessorGUI(QMainWindow):
         self.additional_table_tab_3_layout.addWidget(self.additional_table_3)
 
         # Set up 9 figures
-        self.figures = [Figure() for _ in range(9)]
+        self.figures = [Figure() for _ in range(10)]
         self.canvases = [FigureCanvas(fig) for fig in self.figures]
 
-        # Place 4 figures (charts) in a 2x2 layout
         self.chart_layout.addWidget(self.canvases[0], 0, 0)
         self.chart_layout.addWidget(self.canvases[1], 0, 1)
         self.chart_layout.addWidget(self.canvases[2], 1, 0)
         self.chart_layout.addWidget(self.canvases[3], 1, 1)
 
-        # "Add Files" button in Charts tab
         self.add_file_button_charts = QPushButton("Add Files")
         self.add_file_button_charts.clicked.connect(self.add_files)
         self.chart_layout.addWidget(self.add_file_button_charts, 2, 0, 1, 2)
 
-        # The FFT chart is figure[4]
         self.fft_tab_layout.addWidget(self.canvases[4])
 
-        # Red pitaya 4 graphs setup
         self.rp_tab_layout.addWidget(self.canvases[5], 0, 0)
         self.rp_tab_layout.addWidget(self.canvases[6], 0, 1)
         self.rp_tab_layout.addWidget(self.canvases[7], 1, 0)
         self.rp_tab_layout.addWidget(self.canvases[8], 1, 1)
 
-        # Initialize subplots
+        self.fpga_tab_layout.addWidget(self.canvases[9])
+
         self.initialize_plot(0, "Cumulative Accepted Files 1 (JKAM)")
         self.initialize_plot(1, "Cumulative Accepted Files 2 (Bin/FPGA)")
         self.initialize_plot(2, "Cumulative Accepted Files (Red Pitaya)")
@@ -1195,7 +1225,8 @@ class FileProcessorGUI(QMainWindow):
         self.initialize_rp_plot(7)
         self.initialize_rp_plot(8)
 
-        # Streaming Controls
+        self.initialize_fpga_plot(9)
+
         self.stream_controls_layout = QHBoxLayout()
         self.stream_dir_label = QLabel("Stream Directory:")
         self.stream_dir_edit = QLineEdit(os.getcwd())
@@ -1237,7 +1268,7 @@ class FileProcessorGUI(QMainWindow):
 
     def initialize_plot(self, index, title_str):
         ax = self.figures[index].add_subplot(111)
-        ax.plot([], [], marker="o")
+        ax.plot([], [])
         ax.set_title(title_str)
         ax.set_xlabel("Shot Number")
         ax.set_ylabel("Cumulative Value")
@@ -1255,6 +1286,14 @@ class FileProcessorGUI(QMainWindow):
         ax.set_title("FFT of the Signal")
         ax.set_xlabel("Frequency")
         ax.set_ylabel("Amplitude")
+        self.canvases[index].draw()
+
+    def initialize_fpga_plot(self, index):
+        ax = self.figures[index].add_subplot(111)
+        ax.plot([], [])
+        ax.set_title("FPGA Atom Input Times")
+        ax.set_xlabel("Time (us)")
+        ax.set_ylabel("Atoms In (Y/N)")
         self.canvases[index].draw()
 
     def add_files(self):
@@ -1305,11 +1344,6 @@ class FileProcessorGUI(QMainWindow):
         print("Stream stopped.")
 
     def check_for_new_files(self):
-        """
-        Recursively checks subfolders (RedPitaya, PhotonTimer, High NA Imaging, gage, etc.)
-        The acceptance logic for JKAM, GageScope, FPGA, or Red Pitaya remains unchanged;
-        only how we scan for new files is adjusted.
-        """
         if not self.inputs_accepted:
             return
 
@@ -1318,7 +1352,6 @@ class FileProcessorGUI(QMainWindow):
             print(f"Invalid stream directory: {watch_dir}")
             return
 
-        # Look into each subfolder in watch_dir
         subfolders = sorted(
             d for d in os.listdir(watch_dir)
             if os.path.isdir(os.path.join(watch_dir, d))
@@ -1338,12 +1371,10 @@ class FileProcessorGUI(QMainWindow):
                 self.stream_processed_files.add(nf)
 
     def closeEvent(self, event):
-        """Clean up resources before closing."""
         self.cleanup()
         super().closeEvent(event)
 
     def cleanup(self):
-        """Release resources."""
         self.jkam_h5_file_handler.jkam_files.clear()
         self.gage_h5_file_handler.gage_files.clear()
         self.bin_handler.bin_files.clear()
