@@ -1,10 +1,16 @@
-#TRYNA DO IT ON 2/19
-
+#3/13 Red Pitaya atomatic file ingestion Integration - hopefully works only tested locally - if not revert to prev (2/19?) version 
 import sys
 import time
 import os
 import warnings
 import numpy as np
+import h5py
+import pickle
+from scipy import signal
+
+# -------------------- NEW: we need paramiko for SSH/SFTP --------------------
+import paramiko
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QWidget, QTabWidget, QGridLayout, QHeaderView,
@@ -13,9 +19,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-import h5py
-from scipy import signal
-import pickle
 
 ###############################################################################
 #                          JKAM Handler                                       #
@@ -162,6 +165,10 @@ class JkamH5FileHandler:
         # Update JKAM chart & the FFT chart
         self.update_cumulative_plot()
         self.update_fft_plot()
+
+        if self.shots_num % 5 == 0:
+            # Attempt to download the Red Pitaya files into the user‐specified folder - if folder isnt specified then it;ll just say print saying cant save
+            self.gui.redpitaya_handler.download_redpitaya_files()
 
     def update_cumulative_plot(self):
         fig = self.gui.figures[0]
@@ -363,22 +370,19 @@ class BinFileHandler:
         # Store the timestamps for this shot
         self.PT_cavity_timestamp_array_raw.append(timestamps)
 
-        # Plot the FPGA atom input times using a stem plot
+        # Plot the FPGA atom input times using a line or scatter
         fig = self.gui.figures[9]
         fig.clear()
         ax = fig.add_subplot(111)
         if timestamps.size == 0:
             ax.text(0.5, 0.5, "No FPGA timestamps", ha='center', va='center', transform=ax.transAxes)
         else:
-            ax.stem(timestamps, np.ones_like(timestamps), linefmt='b-', markerfmt='bo', basefmt=" ")
-        ax.set_title("FPGA Atom Input Times")
+            # ax.stem(timestamps, np.ones_like(timestamps), linefmt='b-', markerfmt='bo', basefmt=" ")
+            ax.plot(timestamps, np.arange(len(timestamps)), ls='-', marker='o', color='b')
+        ax.set_title("FPGA Photon Input Times")
         ax.set_xlabel("Time (us)")
-        ax.set_ylabel("Atoms In (Y/N)")
+        ax.set_ylabel("Photons In Count")
         self.gui.canvases[9].draw()
-
-
-
-    # The old process_timer_py is removed in favor of the vectorized update_fpga_graph.
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
@@ -550,6 +554,7 @@ class GageScopeH5FileHandler:
             print(f"Error accessing file time for {file}: {e}")
             return
 
+        # Prevent duplicates
         if file_ctime in self.gage_creation_time_array:
             return
 
@@ -699,6 +704,7 @@ class GageScopeH5FileHandler:
 class RedPitayaFileHandler:
     """
     Handles Red Pitaya .txt files with acceptance logic vs. JKAM data.
+    Also contains method to auto-SCP from Red Pitaya into a local folder.
     """
     def __init__(self, gui):
         self.gui = gui
@@ -726,6 +732,62 @@ class RedPitayaFileHandler:
         self.done2 = 0
         self.done3 = 0
         self.done4 = 0
+
+    def download_redpitaya_files(self):
+        """
+        Attempt to SSH into the Red Pitaya and SFTP-get the text files into the
+        user-specified local directory. Adjust as needed for your environment.
+        """
+        host = "169.254.13.29"
+        username = "root"
+        password = "root"
+
+        # This is where those files live on the Red Pitaya. Adjust if needed.
+        remote_folder = "/root/RedPitaya/"
+
+        # The files you want to copy over:
+        rp_filenames = [
+            "phicav.txt",
+            "phiperp.txt",
+            "cnstperp.txt",
+            "histcav.txt",
+            "histperp.txt",
+            "lencav.txt",
+            "lenperp.txt",
+            "outcav.txt",
+            "outperp.txt",
+        ]
+
+        # The local destination folder typed into the GUI:
+        local_dir = self.gui.rp_download_dir_edit.text().strip()
+        if not local_dir:
+            print("No local Red Pitaya download directory specified. Skipping download.")
+            return
+
+        # Ensure local directory exists
+        os.makedirs(local_dir, exist_ok=True)
+
+        # Perform SFTP
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(host, username=username, password=password)
+
+            sftp = client.open_sftp()
+
+            for fname in rp_filenames:
+                remote_file = os.path.join(remote_folder, fname)
+                local_file = os.path.join(local_dir, fname)
+                #i used print below for debugging but since its happening every 5 shots its gonna be too much so not doing it rn
+                #print(f"Downloading {remote_file} -> {local_file}")
+                sftp.get(remote_file, local_file)
+
+            sftp.close()
+            client.close()
+            # Don't print this below either for same reason as above
+            #print("Successfully downloaded Red Pitaya files.")
+        except Exception as e:
+            print(f"Error downloading from Red Pitaya: {e}")
 
     def load_data(self, file):
         """ Helper to load data and ensure it is 2D. """
@@ -1088,6 +1150,13 @@ class FileProcessorGUI(QMainWindow):
         self.feature_options_layout.addWidget(self.window_select_label)
         self.feature_options_layout.addWidget(self.window_select)
 
+        # ---------------------- NEW: Field to specify local RP download folder ---
+        self.rp_download_dir_label = QLabel("Red Pitaya Download Folder:")
+        self.rp_download_dir_edit = QLineEdit("C:\\Users\\jayom\\Downloads\\run4\\rp-automatic")
+        self.feature_options_layout.addWidget(self.rp_download_dir_label)
+        self.feature_options_layout.addWidget(self.rp_download_dir_edit)
+        # -------------------------------------------------------------------------
+
         # Accept Inputs
         self.accept_button = QPushButton("Accept Inputs")
         self.accept_button.clicked.connect(self.accept_inputs)
@@ -1144,7 +1213,7 @@ class FileProcessorGUI(QMainWindow):
         self.rp_tab_layout = QGridLayout(self.rp_tab)
         self.tabs.addTab(self.rp_tab, "Red Pitaya Graphs")
 
-        #FPGA Visualizations Tab
+        # FPGA Visualizations Tab
         self.fpga_tab = QWidget()
         self.fpga_tab_layout = QVBoxLayout(self.fpga_tab)
         self.tabs.addTab(self.fpga_tab, "FPGA Graphs")
@@ -1192,7 +1261,7 @@ class FileProcessorGUI(QMainWindow):
         self.additional_table_3.horizontalHeader().setStretchLastSection(True)
         self.additional_table_tab_3_layout.addWidget(self.additional_table_3)
 
-        # Set up 9 figures
+        # Set up 10 figures
         self.figures = [Figure() for _ in range(10)]
         self.canvases = [FigureCanvas(fig) for fig in self.figures]
 
