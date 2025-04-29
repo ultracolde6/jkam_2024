@@ -1,109 +1,168 @@
-#3/13 Red Pitaya atomatic file ingestion Integration - hopefully works only tested locally - if not revert to prev (2/19?) version 
+#4/29 version iwth atom survival/brightness plots - revert back to 3/13 or 2/19 versions if doesn't work cause this one only tested locally and unsure if outputs are correct at all
+#Prev one was 3/13 Red Pitaya atomatic file ingestion Integration - hopefully works only tested locally - if not revert to prev (2/19?) version 
 import sys
 import time
 import os
 import warnings
+import traceback
 import numpy as np
-import h5py
-import pickle
-from scipy import signal
-
-# -------------------- NEW: we need paramiko for SSH/SFTP --------------------
-import paramiko
-
+import matplotlib.pyplot as plt
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QWidget, QTabWidget, QGridLayout, QHeaderView,
     QLabel, QHBoxLayout, QLineEdit, QDockWidget, QCheckBox, QComboBox
 )
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QRunnable, QThreadPool, pyqtSlot
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import h5py
+from scipy import signal
+import pickle
+import paramiko
 
-###############################################################################
-#                          JKAM Handler                                       #
-###############################################################################
+# -------------------- ROI Definitions --------------------
+roi_width = 16
+roi_height = 16
+roi_area = roi_width * roi_height
+
+def roi_center(tweezer_freq):
+    center_x = round(2 * (0.01 * (tweezer_freq - 108)**2 + 26.8 * (tweezer_freq - 100) + 414)) / 2
+    center_y = round(2 * (-0.5 * (tweezer_freq - 100) + 28)) / 2
+    return [center_x, center_y]
+
+def roi_slice_func(tweezer_freq):
+    cx, cy = roi_center(tweezer_freq)
+    y0 = round(cy - roi_height/2)
+    y1 = round(cy + roi_height/2)
+    x0 = round(cx - roi_width/2)
+    x1 = round(cx + roi_width/2)
+    return (slice(y0, y1, 1), slice(x0, x1, 1))
+
+# -------------------- Atom-Level Analysis --------------------
+class AtomAnalysisHandler:
+    def __init__(self, gui, batch_size: int = 5):
+        self.gui = gui
+        self.batch_size = batch_size
+        self.num_frames = 3
+        self.tweezer_freq_list = 88 + 0.8 * np.arange(40)
+        self.num_tweezers = len(self.tweezer_freq_list)
+        thresh = 400 * np.ones(self.num_tweezers)
+        self.upper_threshold_mat = [thresh] * self.num_frames
+        self._buffer = []
+        self._history = []
+
+    def add_shot(self, brightness_tensor: np.ndarray):
+        if brightness_tensor.shape != (self.num_frames, self.num_tweezers):
+            print("[AtomAnalysis] bad tensor shape", brightness_tensor.shape)
+            return
+        self._buffer.append(brightness_tensor)
+        self._history.append(brightness_tensor)
+        if len(self._buffer) >= self.batch_size:
+            self._compute_and_draw()
+            self._buffer.clear()
+
+    def _compute_and_draw(self):
+        arr = np.stack(self._history, axis=0)
+        N = arr.shape[0]
+        existence = np.zeros_like(arr, dtype=bool)
+        for f in range(self.num_frames):
+            existence[:, f, :] = arr[:, f, :] > self.upper_threshold_mat[f]
+
+        survival = np.full(self.num_tweezers, np.nan)
+        surv_err = np.full(self.num_tweezers, np.nan)
+        brightness = np.full(self.num_tweezers, np.nan)
+        bright_err = np.full(self.num_tweezers, np.nan)
+
+        for tw in range(self.num_tweezers):
+            mask = np.logical_and(existence[:,0,tw], existence[:,1,tw])
+            loaded = np.sum(existence[:,0,tw])
+            if loaded > 0:
+                surv_val = np.count_nonzero(mask) / loaded
+                survival[tw] = surv_val
+                surv_err[tw] = np.sqrt(surv_val * (1 - surv_val) / loaded)
+                brightness[tw] = np.nanmean(arr[:,0,tw][mask])
+                bright_err[tw] = np.nanstd(arr[:,0,tw][mask])
+
+        loading = np.sum(existence[:,0,:], axis=0) / N
+        self._draw(survival, surv_err, loading, brightness, bright_err)
+
+    def _draw(self, surv, s_err, load, bright, b_err):
+        fig = self.gui.figures[10]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.errorbar(self.tweezer_freq_list, surv, yerr=s_err, marker='o', ls='-', label='Survival')
+        ax.plot(self.tweezer_freq_list, load, marker='x', ls='--', label='Loading')
+        ax.errorbar(self.tweezer_freq_list, bright/1000, yerr=b_err/1000,
+                    marker='s', ls=':', label='Brightness×1e3')
+        ax.set_ylim(0, 1.1)
+        ax.set_xlabel('Tweezer Freq (MHz)')
+        ax.set_title('Per-Tweezer Metrics (Rolling)')
+        ax.legend()
+        self.gui.canvases[10].draw()
+
+# -------------------- Worker --------------------
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn, self.args, self.kwargs = fn, args, kwargs
+
+    @pyqtSlot()
+    def run(self):
+        self.fn(*self.args, **self.kwargs)
+
+# -------------------- JKAM Handler --------------------
 class JkamH5FileHandler:
     def __init__(self, gui):
         self.gui = gui
-        self.jkam_files = []  # We'll store file paths here
-
-        # Data arrays
-        self.jkam_creation_time_array = []  # Creation times for each shot
-        self.shots_dict = {}                # {shot_index: space_correct_boolean}
-        self.time_temp_dict = {}            # {shot_index: time_temp_value}
-
-        # Tracking
+        self.jkam_files = []
+        self.jkam_creation_time_array = []
+        self.shots_dict = {}
+        self.time_temp_dict = {}
         self.shots_num = 0
         self.last_passed_idx = 0
         self.start_time = None
-
-        # For the JKAM chart
         self.cumulative_data = []
-        self.highest_count = 0  # Track highest count reached
-
-        # For the FFT chart
+        self.highest_count = 0
         self.all_datapoints = []
-
-        # Defaults (will be updated from GUI)
         self.time_me = False
         self.plot_tenth_shot = False
-        self.het_freq = 0
-        self.dds_freq = 0
-        self.samp_freq = 0
-        self.averaging_time = 0
-        self.step_time = 0
-        self.filter_time = 0
-        self.voltage_conversion = 0
-        self.kappa = 0
-        self.LO_power = 0
-        self.PHOTON_ENERGY = 0
-        self.LO_rate = 0
-        self.photonrate_conversion = 0
-
-        # Window‐function choice (default 'hann')
+        self.het_freq = self.dds_freq = self.samp_freq = 0
+        self.averaging_time = self.step_time = self.filter_time = 0
+        self.voltage_conversion = self.kappa = self.LO_power = self.PHOTON_ENERGY = 0
+        self.LO_rate = self.photonrate_conversion = 0
         self.window = "hann"
-        
-        # *** NEW: add avg_time_gap attribute for acceptance in downstream handlers ***
         self.avg_time_gap = 0
 
     def update_settings(self):
-        """ Pull the current GUI settings into local variables. """
-        self.time_me = self.gui.time_me_checkbox.isChecked()
-        self.plot_tenth_shot = self.gui.plot_tenth_shot_checkbox.isChecked()
-        self.het_freq = float(self.gui.het_freq_input.text())
-        self.dds_freq = float(self.gui.dds_freq_input.text())
-        self.samp_freq = float(self.gui.samp_freq_input.text())
-        self.averaging_time = float(self.gui.averaging_time_input.text())
-        self.step_time = float(self.gui.step_time_input.text())
-        self.filter_time = float(self.gui.filter_time_input.text())
-        self.voltage_conversion = float(self.gui.voltage_conversion_input.text())
-        self.kappa = float(self.gui.kappa_input.text())
-        self.LO_power = float(self.gui.LO_power_input.text())
-        self.PHOTON_ENERGY = float(self.gui.PHOTON_ENERGY_input.text())
-        self.LO_rate = float(self.gui.LO_rate_input.text())
-        self.photonrate_conversion = float(self.gui.photonrate_conversion_input.text())
-
-        # Window selection
-        self.window = self.gui.window_select.currentText()
+        g = self.gui
+        self.time_me = g.time_me_checkbox.isChecked()
+        self.plot_tenth_shot = g.plot_tenth_shot_checkbox.isChecked()
+        self.het_freq = float(g.het_freq_input.text())
+        self.dds_freq = float(g.dds_freq_input.text())
+        self.samp_freq = float(g.samp_freq_input.text())
+        self.averaging_time = float(g.averaging_time_input.text())
+        self.step_time = float(g.step_time_input.text())
+        self.filter_time = float(g.filter_time_input.text())
+        self.voltage_conversion = float(g.voltage_conversion_input.text())
+        self.kappa = float(g.kappa_input.text())
+        self.LO_power = float(g.LO_power_input.text())
+        self.PHOTON_ENERGY = float(g.PHOTON_ENERGY_input.text())
+        self.LO_rate = float(g.LO_rate_input.text())
+        self.photonrate_conversion = float(g.photonrate_conversion_input.text())
+        self.window = g.window_select.currentText()
 
     def process_file(self, file):
-        """
-        Process a single JKAM .h5 file. We'll treat file creation time as "time_temp".
-        """
         self.update_settings()
-
         try:
             file_ctime = os.path.getctime(file)
         except Exception as e:
             print(f"Error accessing file time for {file}: {e}")
             return
-
-        # Skip if we already processed it
         if file in self.jkam_files:
             return
 
-        # Verify we can open it
+        # Validate HDF5
         try:
             with h5py.File(file, 'r'):
                 pass
@@ -111,228 +170,153 @@ class JkamH5FileHandler:
             print(f"Error processing JKAM file {file}: {e}")
             return
 
+        # Compute counts & brightness
+        num_tweezers = len(self.gui.atom_analysis_handler.tweezer_freq_list)
+        num_frames = 3
+        counts = np.zeros((num_frames, num_tweezers))
+        try:
+            hf = h5py.File(file, 'r')
+            for f in range(num_frames):
+                ds = hf.get(f'frame-{str(f+2).zfill(2)}')
+                if ds is None:
+                    raise KeyError(f"Missing dataset frame-{str(f+2).zfill(2)}")
+                photo = np.array(ds)
+                for t_idx, tf in enumerate(self.gui.atom_analysis_handler.tweezer_freq_list):
+                    counts[f, t_idx] = np.sum(photo[roi_slice_func(tf)])
+            hf.close()
+        except Exception as e:
+            print(f"Error computing counts for {file}: {e}")
+            traceback.print_exc()
+            return
+
+        brightness = np.zeros_like(counts)
+        for f in range(num_frames-1):
+            brightness[f, :] = counts[f, :] - counts[-1, :]
+        brightness[-1, :] = counts[-1, :]
+
+        # Register shot
         self.jkam_files.append(file)
         self.jkam_creation_time_array.append(file_ctime)
 
-        jkam_avg_time_gap = 0
-        space_correct = True
-        time_temp = file_ctime
-
         if self.shots_num == 0:
             self.start_time = file_ctime
+            self.shots_dict[0] = True
+            self.avg_time_gap = 0
         else:
-            jkam_avg_time_gap = abs((time_temp - self.start_time) / self.shots_num)
-            if (self.shots_num > 0) & (
-                abs(time_temp - self.jkam_creation_time_array[self.shots_num - 1]
-                    - jkam_avg_time_gap) > 0.2 * jkam_avg_time_gap
-            ):
-                space_correct = False
+            gap = abs((file_ctime - self.start_time) / self.shots_num)
+            prev = file_ctime - self.jkam_creation_time_array[self.shots_num - 1]
+            space_ok = abs(prev - gap) <= 0.2 * gap
+            self.shots_dict[self.shots_num] = space_ok
+            self.avg_time_gap = gap
 
-        # Store
-        self.shots_dict[self.shots_num] = space_correct
-        self.time_temp_dict[self.shots_num] = time_temp
+        self.time_temp_dict[self.shots_num] = file_ctime
 
-        # Cumulative data
-        if self.shots_num == 0:
-            new_val = 1
-        elif space_correct:
-            new_val = (self.cumulative_data[self.last_passed_idx] + 1) if self.cumulative_data else 1
+        if self.shots_num == 0 or self.shots_dict[self.shots_num]:
+            val = (self.cumulative_data[self.last_passed_idx] + 1) if self.cumulative_data else 1
+            self.cumulative_data.append(val)
+            if self.shots_dict[self.shots_num]:
+                self.last_passed_idx = self.shots_num
         else:
-            new_val = 0
+            self.cumulative_data.append(0)
 
-        self.cumulative_data.append(new_val)
-        if space_correct:
-            self.last_passed_idx = self.shots_num
         self.shots_num += 1
         self.all_datapoints.append(file_ctime)
-        
-        # *** NEW: update the avg_time_gap attribute so that other file handlers can use it ***
-        self.avg_time_gap = jkam_avg_time_gap
 
-        # Update main JKAM table
-        row_position = self.gui.table.rowCount()
-        self.gui.table.insertRow(row_position)
-        self.gui.table.setItem(row_position, 0, QTableWidgetItem(str(self.shots_num - 1)))
-        self.gui.table.setItem(row_position, 1, QTableWidgetItem(file))
-        self.gui.table.setItem(row_position, 2, QTableWidgetItem(str(space_correct)))
-        summary_text = (
-            f"<b>Start Time:</b> {self.start_time}, "
-            f"<b>Current Time:</b> {file_ctime}, "
-            f"<b>Avg Time Gap:</b> {jkam_avg_time_gap}"
-        )
-        self.gui.table.setItem(row_position, 3, QTableWidgetItem(summary_text))
+        row = self.gui.table.rowCount()
+        self.gui.table.insertRow(row)
+        self.gui.table.setItem(row, 0, QTableWidgetItem(str(self.shots_num - 1)))
+        self.gui.table.setItem(row, 1, QTableWidgetItem(file))
+        self.gui.table.setItem(row, 2, QTableWidgetItem(str(self.shots_dict[self.shots_num - 1])))
+        summary = (f"<b>Start Time:</b> {self.start_time}, "
+                   f"<b>Current Time:</b> {file_ctime}, "
+                   f"<b>Avg Time Gap:</b> {self.avg_time_gap:.3f}")
+        self.gui.table.setItem(row, 3, QTableWidgetItem(summary))
 
-        # Update JKAM chart & the FFT chart
         self.update_cumulative_plot()
         self.update_fft_plot()
 
+        # Feed to atom analysis
+        self.gui.atom_analysis_handler.add_shot(brightness)
+
         if self.shots_num % 5 == 0:
-            # Attempt to download the Red Pitaya files into the user‐specified folder - if folder isnt specified then it;ll just say print saying cant save
             self.gui.redpitaya_handler.download_redpitaya_files()
 
     def update_cumulative_plot(self):
-        fig = self.gui.figures[0]
-        fig.clear()
+        fig = self.gui.figures[0]; fig.clear()
         ax = fig.add_subplot(111)
-        x_vals = range(len(self.cumulative_data))
-        ax.plot(x_vals, self.cumulative_data, marker="o", linestyle="-")
+        ax.plot(range(len(self.cumulative_data)), self.cumulative_data, marker='o')
         ax.set_title("Cumulative Accepted Files 1 (JKAM)")
-        ax.set_xlabel("Shot Number")
-        ax.set_ylabel("Cumulative Value")
+        ax.set_xlabel("Shot Number"); ax.set_ylabel("Cumulative Value")
         self.gui.canvases[0].draw()
 
     def update_fft_plot(self):
-        """
-        Attempt an FFT/demod plot if there's at least one valid GageScope shot.
-        """
-        self.update_settings()
-
-        # We need at least some JKAM data
-        if len(self.jkam_creation_time_array) < 1:
-            return
-
-        # We need at least one GageScope shot
-        num_shots_gage = len(self.gui.gage_h5_file_handler.gage_files)
-        if num_shots_gage == 0:
-            return
-
-        # If LO_rate or kappa <= 0, skip
-        if (self.LO_rate <= 0) or (self.kappa <= 0):
-            print("LO_rate or kappa is <= 0 -- skipping FFT computation.")
-            return
-
-        # If we are timing but GageScope has no creation times
-        if self.time_me and (len(self.gui.gage_h5_file_handler.gage_creation_time_array) == 0):
-            return
-
-        heterodyne_conversion = 1 / np.sqrt(self.LO_rate)
-        cavity_conversion = 1 / np.sqrt(self.kappa)
-        conversion_factor = (self.voltage_conversion *
-                             self.photonrate_conversion *
-                             heterodyne_conversion *
-                             cavity_conversion)
-
-        # Example: define length from the first GageScope file
-        chlen = len(self.gui.gage_h5_file_handler.gage_files[0]['CH1']['CH1_frame0'])
-        t_vec = np.arange(chlen) * (1 / self.samp_freq)
-        ch1_pure_vec = np.exp(-1j * 2 * np.pi * self.dds_freq * t_vec)
-        ch3_pure_vec = np.exp(-1j * 2 * np.pi * self.het_freq * t_vec)
-
-        # Generate a list of "start times" in samples
-        t0_list = np.arange(0, chlen / self.samp_freq - self.filter_time + self.step_time, self.step_time)
-        timebin_array = np.empty((len(t0_list), 2), dtype=float)
-        timebin_array[:, 0] = t0_list
-        timebin_array[:, 1] = t0_list + self.filter_time
-
-        num_segments = 3
-        cmplx_amp_array = np.empty((2, num_shots_gage, num_segments, len(t0_list)), dtype=np.cdouble)
-
-        # Window
-        window_function = self.window
-
-        for shot_num in range(len(self.jkam_creation_time_array)):
-            if (self.gui.gage_h5_file_handler.mask_valid_data is not None and
-                shot_num < len(self.gui.gage_h5_file_handler.mask_valid_data) and
-                self.gui.gage_h5_file_handler.mask_valid_data[shot_num]):
-
-                if shot_num >= len(self.gui.gage_h5_file_handler.gage_files):
-                    continue
-
-                # Access channel data from memory
-                gage_data = self.gui.gage_h5_file_handler.gage_files[shot_num]
-
-                for seg_num in range(num_segments):
-                    ch1 = gage_data['CH1'][f'CH1_frame{seg_num}'] * conversion_factor
-                    ch3 = gage_data['CH3'][f'CH3_frame{seg_num}'] * conversion_factor
-
-                    cmplx_amp_list_ch1 = t0_list * 0j
-                    cmplx_amp_list_ch3 = t0_list * 0j
-
-                    for i, t0_f in enumerate(t0_list):
-                        t0_i = int(round(t0_f * self.samp_freq))
-                        t1_i = t0_i + int(round(self.filter_time * self.samp_freq))
-
-                        length = t1_i - t0_i
-                        if length <= 0:
-                            cmplx_amp_list_ch1[i] = np.nan
-                            cmplx_amp_list_ch3[i] = np.nan
-                            continue
-
-                        if window_function == 'flattop':
-                            w = signal.windows.flattop(length)
-                        elif window_function == 'square':
-                            w = 1
-                        else:  # default 'hann'
-                            w = signal.windows.hann(length) * 2
-
-                        ch1_segment = ch1[t0_i:t1_i]
-                        ch3_segment = ch3[t0_i:t1_i]
-
-                        ch1_demod = ch1_segment * w * ch1_pure_vec[t0_i:t1_i]
-                        ch3_demod = ch3_segment * w * ch3_pure_vec[t0_i:t1_i]
-
-                        ch1_sum = np.cumsum(ch1_demod)
-                        ch3_sum = np.cumsum(ch3_demod)
-
-                        cmplx_amp_list_ch1[i] = (ch1_sum[-1] - ch1_sum[0]) / length
-                        cmplx_amp_list_ch3[i] = (ch3_sum[-1] - ch3_sum[0]) / length
-
-                    cmplx_amp_array[0, shot_num, seg_num] = cmplx_amp_list_ch1
-                    cmplx_amp_array[1, shot_num, seg_num] = cmplx_amp_list_ch3
-
-            else:
-                if shot_num < cmplx_amp_array.shape[1]:
-                    cmplx_amp_array[:, shot_num, :, :] = np.nan
-
-        # Save results
         try:
-            with open(
-                f'C:\\Users\\jayom\\Downloads\\fft_gage_cmplx_amp_{self.filter_time}_{self.step_time}.pkl', 'wb'
-            ) as f1:
-                pickle.dump(cmplx_amp_array, f1)
+            num_g = len(self.gui.gage_h5_file_handler.gage_files)
+            if num_g < 2 or self.LO_rate <= 0 or self.kappa <= 0:
+                return
+            het_c = 1/np.sqrt(self.LO_rate)
+            cav_c = 1/np.sqrt(self.kappa)
+            conv = (self.voltage_conversion *
+                    self.photonrate_conversion *
+                    het_c * cav_c)
+            base = self.gui.gage_h5_file_handler.gage_files[0]['CH1']['CH1_frame0']
+            chlen = len(base)
+            t_vec = np.arange(chlen) * (1 / self.samp_freq)
+            pure1 = np.exp(-1j * 2 * np.pi * self.dds_freq * t_vec)
+            pure3 = np.exp(-1j * 2 * np.pi * self.het_freq * t_vec)
+            t0 = np.arange(0, chlen / self.samp_freq - self.filter_time + self.step_time, self.step_time)
+            timebin = np.vstack((t0, t0 + self.filter_time)).T
+            n_seg = 3
+            cmplx = np.empty((2, num_g, n_seg, len(t0)), dtype=np.cdouble)
+            mask = self.gui.gage_h5_file_handler.mask_valid_data
+            for shot in range(len(self.jkam_creation_time_array)):
+                if shot < len(mask) and mask[shot]:
+                    data = self.gui.gage_h5_file_handler.gage_files[shot]
+                    for seg in range(n_seg):
+                        ch1 = data['CH1'][f'CH1_frame{seg}'] * conv
+                        ch3 = data['CH3'][f'CH3_frame{seg}'] * conv
+                        for i, start in enumerate(t0):
+                            i0 = int(round(start * self.samp_freq))
+                            i1 = i0 + int(round(self.filter_time * self.samp_freq))
+                            L = i1 - i0
+                            if L <= 0:
+                                cmplx[0, shot, seg, i] = np.nan
+                                cmplx[1, shot, seg, i] = np.nan
+                            else:
+                                w = (signal.windows.flattop(L) if self.window == 'flattop'
+                                     else 1 if self.window == 'square'
+                                     else signal.windows.hann(L) * 2)
+                                d1 = ch1[i0:i1] * w * pure1[i0:i1]
+                                d3 = ch3[i0:i1] * w * pure3[i0:i1]
+                                c1 = np.cumsum(d1); c3 = np.cumsum(d3)
+                                cmplx[0, shot, seg, i] = (c1[-1] - c1[0]) / L
+                                cmplx[1, shot, seg, i] = (c3[-1] - c3[0]) / L
+                else:
+                    if shot < num_g:
+                        cmplx[:, shot, :, :] = np.nan
 
-            with open(
-                f'C:\\Users\\jayom\\Downloads\\fft_gage_timebin_{self.filter_time}_{self.step_time}.pkl', 'wb'
-            ) as f3:
-                pickle.dump(timebin_array, f3)
+            pickle.dump(cmplx, open(f'fft_cmplx_{self.filter_time}_{self.step_time}.pkl','wb'))
+            pickle.dump(timebin, open(f'fft_timebin_{self.filter_time}_{self.step_time}.pkl','wb'))
+
+            fig = self.gui.figures[4]; fig.clear()
+            ax = fig.add_subplot(111)
+            valid = [i for i in range(num_g) if i < len(mask) and mask[i]]
+            if valid:
+                last = valid[-1]
+                mag = np.abs(cmplx[0, last, 0, :])
+                ax.plot(mag, label=f"Shot {last}, CH1 seg0")
+                ax.legend()
+            else:
+                ax.text(0.5,0.5,"No valid GageScope shots",ha='center',va='center',transform=ax.transAxes)
+            ax.set_title("FFT Magnitude (Segment 0)")
+            self.gui.canvases[4].draw()
         except Exception as e:
-            print("Could not save FFT results to pickle:", e)
+            print("Exception in update_fft_plot:", e); traceback.print_exc()
 
-        # Plot something on figure[4]
-        fig_fft = self.gui.figures[4]
-        fig_fft.clear()
-        ax = fig_fft.add_subplot(111)
-
-        # Find valid shots that have data
-        valid_shots = []
-        for s in range(num_shots_gage):
-            if (s < len(self.gui.gage_h5_file_handler.mask_valid_data) and
-                self.gui.gage_h5_file_handler.mask_valid_data[s]):
-                valid_shots.append(s)
-
-        if not valid_shots:
-            ax.text(0.5, 0.5, "No valid GageScope shots found for FFT plotting",
-                    ha='center', va='center', transform=ax.transAxes)
-        else:
-            last_shot = valid_shots[-1]
-            ch1_magnitude = np.abs(cmplx_amp_array[0, last_shot, 0, :])
-            ax.plot(ch1_magnitude, label=f"Shot {last_shot}, CH1 seg0 (magnitude)")
-            ax.set_title("FFT Magnitude (Segment 0, last valid shot)")
-            ax.legend()
-
-        self.gui.canvases[4].draw()
-
-
-###############################################################################
-#                      FPGA / Bin Handler                                     #
-###############################################################################
+# -------------------- FPGA / Bin Handler --------------------
 class BinFileHandler:
-    """
-    Handles FPGA .bin files with acceptance logic against JKAM data.
-    """
     def __init__(self, gui):
         self.gui = gui
-
         self.bin_files = []
         self.fpga_creation_time_array = []
         self.mask_valid_data = []
@@ -343,196 +327,122 @@ class BinFileHandler:
         self.final_accepted = []
         self.start_time = None
         self.avg_time_gap = 0
-        # For FPGA graphing, we only store the essential timestamp data.
         self.PT_cavity_timestamp_array_raw = []
-
-        # Track which shot indexes we've already printed "FPGA error at shot X" for
         self.fpga_error_shots_reported = set()
 
     def update_fpga_graph(self, filename):
-        unit_time_PT = 1/700  # in microseconds
-
-        # Read the binary file and unpack bits
+        unit_time_PT = 1/700
         raw_data = np.fromfile(filename, dtype=np.uint8)
-        bin_data = np.unpackbits(raw_data)
-        # Reshape into events of 32 bits each
-        events = bin_data.reshape(-1, 32)
-        # Pre-calculate weights for the first 25 bits (time portion)
+        bits = np.unpackbits(raw_data).reshape(-1,32)
         tparts = np.concatenate((np.flip(2**np.arange(8)),
                                  np.flip(2**np.arange(8,16)),
                                  np.flip(2**np.arange(16,24)),
                                  [16777216]))
-        # Vectorized dot product to compute timestamps for each event
-        timestamps = events[:, :25].dot(tparts)
-        # Sort and convert to time units
-        timestamps = unit_time_PT * np.sort(timestamps)
-
-        # Store the timestamps for this shot
+        timestamps = unit_time_PT * np.sort(bits[:,:25].dot(tparts))
         self.PT_cavity_timestamp_array_raw.append(timestamps)
-
-        # Plot the FPGA atom input times using a line or scatter
-        fig = self.gui.figures[9]
-        fig.clear()
+        fig = self.gui.figures[9]; fig.clear()
         ax = fig.add_subplot(111)
         if timestamps.size == 0:
-            ax.text(0.5, 0.5, "No FPGA timestamps", ha='center', va='center', transform=ax.transAxes)
+            ax.text(0.5,0.5,"No FPGA timestamps",ha='center',va='center',transform=ax.transAxes)
         else:
-            # ax.stem(timestamps, np.ones_like(timestamps), linefmt='b-', markerfmt='bo', basefmt=" ")
-            ax.plot(timestamps, np.arange(len(timestamps)), ls='-', marker='o', color='b')
+            ax.plot(timestamps, np.arange(len(timestamps)), ls='-', marker='o')
         ax.set_title("FPGA Photon Input Times")
-        ax.set_xlabel("Time (us)")
-        ax.set_ylabel("Photons In Count")
+        ax.set_xlabel("Time (µs)"); ax.set_ylabel("Photons In Count")
         self.gui.canvases[9].draw()
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
-
         if file in self.bin_files:
             return
-
         try:
             file_ctime = os.path.getctime(file)
-        except Exception as e:
-            print(f"Error accessing file time for {file}: {e}")
+        except:
             return
-
         self.bin_files.append(file)
         self.fpga_creation_time_array.append(file_ctime)
-
         if len(self.fpga_creation_time_array) == 1:
             self.start_time = file_ctime
-
         self.rerun_acceptance()
-
-        new_shot_index = len(self.fpga_creation_time_array) - 1
-        data_valid = False
-        jkam_space_correct_str = "None"
-
-        if 0 <= new_shot_index < len(self.mask_valid_data):
-            data_valid = self.mask_valid_data[new_shot_index]
-
-        jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-        if new_shot_index in jkam_space_dict:
-            jkam_space_correct_str = str(jkam_space_dict[new_shot_index])
-
-        row_position = self.gui.additional_table_1.rowCount()
-        self.gui.additional_table_1.insertRow(row_position)
-        self.gui.additional_table_1.setItem(row_position, 0, QTableWidgetItem(str(new_shot_index)))
-        self.gui.additional_table_1.setItem(row_position, 1, QTableWidgetItem(file))
-        self.gui.additional_table_1.setItem(row_position, 2, QTableWidgetItem(str(data_valid)))
-        self.gui.additional_table_1.setItem(row_position, 3, QTableWidgetItem(jkam_space_correct_str))
-
-        summary_text = (
-            f"<b>Start Time:</b> {self.start_time}, "
-            f"<b>Current Time:</b> {file_ctime}, "
-            f"<b>Avg Time Gap:</b> {self.avg_time_gap}"
-        )
-        self.gui.additional_table_1.setItem(row_position, 4, QTableWidgetItem(summary_text))
-
+        idx = len(self.fpga_creation_time_array) - 1
+        valid = idx < len(self.mask_valid_data) and self.mask_valid_data[idx]
+        jkam_str = str(self.gui.jkam_h5_file_handler.shots_dict.get(idx, "None"))
+        row = self.gui.additional_table_1.rowCount()
+        self.gui.additional_table_1.insertRow(row)
+        for col, val in enumerate([idx, file, valid, jkam_str]):
+            self.gui.additional_table_1.setItem(row, col, QTableWidgetItem(str(val)))
+        summary = (f"<b>Start Time:</b> {self.start_time}, "
+                   f"<b>Current Time:</b> {file_ctime}, "
+                   f"<b>Avg Time Gap:</b> {self.avg_time_gap:.3f}")
+        self.gui.additional_table_1.setItem(row, 4, QTableWidgetItem(summary))
         self.update_fpga_graph(file)
         self.update_chart_2()
 
     def rerun_acceptance(self):
-        self.highest_count = 0
-        num_shots = len(self.fpga_creation_time_array)
-
-        if len(self.final_accepted) < num_shots:
-            self.final_accepted += [False] * (num_shots - len(self.final_accepted))
-
-        if num_shots <= 1:
+        n = len(self.fpga_creation_time_array)
+        if len(self.final_accepted) < n:
+            self.final_accepted += [False] * (n - len(self.final_accepted))
+        if n <= 1:
             self.avg_time_gap = 0
         else:
-            total_span = abs(self.fpga_creation_time_array[-1] - self.fpga_creation_time_array[0])
-            self.avg_time_gap = abs(total_span / (num_shots - 1))
-
-        self.mask_valid_data = np.zeros(num_shots, dtype=bool)
-        self.jkam_fpga_matchlist = np.full(num_shots, -1, dtype=int)
-        self.color_array = ["r"] * num_shots
-
-        jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-        jkam_time_temp_dict = self.gui.jkam_h5_file_handler.time_temp_dict
-
-        fpga_ctimes = np.array(self.fpga_creation_time_array)
-        fpga_index_list = np.arange(num_shots)
-
-        for shot_num in range(num_shots):
-            if self.final_accepted[shot_num]:
-                self.mask_valid_data[shot_num] = True
-                self.color_array[shot_num] = "g"
+            span = abs(self.fpga_creation_time_array[-1] - self.fpga_creation_time_array[0])
+            self.avg_time_gap = span / (n - 1)
+        self.mask_valid_data = np.zeros(n, dtype=bool)
+        self.jkam_fpga_matchlist = np.full(n, -1, dtype=int)
+        self.color_array = ["r"] * n
+        jt = self.gui.jkam_h5_file_handler.time_temp_dict
+        js = self.gui.jkam_h5_file_handler.shots_dict
+        ft = np.array(self.fpga_creation_time_array)
+        for i in range(n):
+            if self.final_accepted[i]:
+                self.mask_valid_data[i] = True
+                self.color_array[i] = "g"
                 continue
-
-            if shot_num in jkam_time_temp_dict and shot_num in jkam_space_dict:
-                jkam_time = jkam_time_temp_dict[shot_num]
-                space_correct = jkam_space_dict[shot_num]
-
+            if i in jt and i in js and js[i]:
                 if self.avg_time_gap == 0:
-                    if space_correct:
-                        self.mask_valid_data[shot_num] = True
-                        self.color_array[shot_num] = "g"
-                        self.jkam_fpga_matchlist[shot_num] = shot_num
-                        self.final_accepted[shot_num] = True
-                    else:
-                        self.mask_valid_data[shot_num] = False
-                        self.color_array[shot_num] = "r"
+                    self.mask_valid_data[i] = True
+                    self.color_array[i] = "g"
+                    self.jkam_fpga_matchlist[i] = i
+                    self.final_accepted[i] = True
                 else:
-                    time_diffs = np.abs(fpga_ctimes - jkam_time)
-                    min_diff = np.min(time_diffs)
-                    if (min_diff <= 0.3 * self.avg_time_gap) and space_correct:
-                        self.mask_valid_data[shot_num] = True
-                        closest_idx = np.argmin(time_diffs)
-                        self.jkam_fpga_matchlist[shot_num] = fpga_index_list[closest_idx]
-                        self.color_array[shot_num] = "g"
-                        self.final_accepted[shot_num] = True
-                    else:
-                        self.mask_valid_data[shot_num] = False
-                        self.color_array[shot_num] = "r"
-                        if shot_num not in self.fpga_error_shots_reported:
-                            print(f"FPGA error at shot {shot_num}")
-                            self.fpga_error_shots_reported.add(shot_num)
+                    diffs = np.abs(ft - jt[i])
+                    md = np.min(diffs)
+                    if md <= 0.3 * self.avg_time_gap:
+                        self.mask_valid_data[i] = True
+                        self.jkam_fpga_matchlist[i] = int(np.argmin(diffs))
+                        self.color_array[i] = "g"
+                        self.final_accepted[i] = True
+                    elif i not in self.fpga_error_shots_reported:
+                        print(f"FPGA error at shot {i}")
+                        self.fpga_error_shots_reported.add(i)
             else:
-                self.mask_valid_data[shot_num] = False
-                self.jkam_fpga_matchlist[shot_num] = -1
-
+                self.mask_valid_data[i] = False
+                self.jkam_fpga_matchlist[i] = -1
         self.cumulative_data = []
-        current_count = 0
-
-        for shot_num in range(num_shots):
-            if self.mask_valid_data[shot_num]:
-                if not self.cumulative_data or self.cumulative_data[-1] == 0:
-                    current_count = self.highest_count + 1
-                else:
-                    current_count += 1
-                self.highest_count = max(self.highest_count, current_count)
-                self.cumulative_data.append(current_count)
+        curr = 0
+        for ok in self.mask_valid_data:
+            if ok:
+                curr = (self.highest_count + 1) if not self.cumulative_data or self.cumulative_data[-1] == 0 else curr + 1
+                self.highest_count = max(self.highest_count, curr)
+                self.cumulative_data.append(curr)
             else:
                 self.cumulative_data.append(0)
 
     def update_chart_2(self):
-        fig = self.gui.figures[1]
-        fig.clear()
+        fig = self.gui.figures[1]; fig.clear()
         ax = fig.add_subplot(111)
-
-        x_vals = np.arange(len(self.cumulative_data))
-        for i, val in enumerate(self.cumulative_data):
-            ax.plot(x_vals[i], val, marker="o", color=self.color_array[i])
-        ax.plot(x_vals, self.cumulative_data, linestyle="-", alpha=0.3)
+        x = np.arange(len(self.cumulative_data))
+        for i, v in enumerate(self.cumulative_data):
+            ax.plot(x[i], v, marker='o', color=self.color_array[i])
+        ax.plot(x, self.cumulative_data, linestyle='-', alpha=0.3)
         ax.set_title("Cumulative Accepted Files 2 (Bin/FPGA)")
-        ax.set_xlabel("Shot Number")
-        ax.set_ylabel("Cumulative Value")
+        ax.set_xlabel("Shot Number"); ax.set_ylabel("Cumulative Value")
         self.gui.canvases[1].draw()
 
-
-###############################################################################
-#                      GageScope .h5 Handler                                  #
-###############################################################################
+# -------------------- GageScope Handler --------------------
 class GageScopeH5FileHandler:
-    """
-    Properly closes each GageScope file after extracting only needed data.
-    """
     def __init__(self, gui):
         self.gui = gui
-
-        self.gage_files = []  # store dictionaries of channel data
+        self.gage_files = []
         self.gage_creation_time_array = []
         self.mask_valid_data = []
         self.jkam_gage_matchlist = []
@@ -541,182 +451,133 @@ class GageScopeH5FileHandler:
         self.final_accepted = []
         self.start_time = None
         self.avg_time_gap = 0
-
-        # Track which shot indexes we've already printed "Gage error at shot X" for
         self.gage_error_shots_reported = set()
 
     def process_file(self, file):
+        print(f"\n=== GageScope processing start: {file} ===")
+        if not os.path.isfile(file):
+            print(f"File not found: {file}")
+            return
+        try:
+            ok = h5py.is_hdf5(file)
+        except Exception as e:
+            print(f"HDF5 check error: {e}")
+            return
+        print(f"is_hdf5: {ok}")
+        if not ok:
+            print(f"Not HDF5: {file}")
+            return
+        ctime = os.path.getctime(file)
+        if ctime in self.gage_creation_time_array:
+            print(f"Duplicate ctime {ctime}")
+            return
+        try:
+            with h5py.File(file,'r') as h5f:
+                keys = list(h5f.keys())
+                print(f"Datasets: {keys}")
+                exp = [f'CH1_frame{i}' for i in range(3)] + [f'CH3_frame{i}' for i in range(3)]
+                miss = [ds for ds in exp if ds not in keys]
+                if miss:
+                    print(f"Missing: {miss}")
+                    return
+                ch1 = {}; ch3 = {}
+                for ds in exp:
+                    arr = np.array(h5f[ds])
+                    if ds.startswith('CH1_'):
+                        ch1[ds] = arr
+                    else:
+                        ch3[ds] = arr
+        except Exception as e:
+            print(f"GageScope read error: {e}")
+            traceback.print_exc()
+            return
+        self.gage_files.append({'CH1': ch1, 'CH3': ch3})
+        self.gage_creation_time_array.append(ctime)
+        print(f"Registered GageScope at {ctime}")
+        if len(self.gage_creation_time_array) == 1:
+            self.start_time = ctime
         self.gui.jkam_h5_file_handler.update_settings()
-
+        self.rerun_acceptance_gage()
+        idx = len(self.gage_creation_time_array) - 1
+        valid = idx < len(self.mask_valid_data) and self.mask_valid_data[idx]
+        jstr = str(self.gui.jkam_h5_file_handler.shots_dict.get(idx, "None"))
+        row = self.gui.additional_table_2.rowCount()
+        self.gui.additional_table_2.insertRow(row)
+        for col, val in enumerate([idx, file, valid, jstr]):
+            self.gui.additional_table_2.setItem(row, col, QTableWidgetItem(str(val)))
+        summ = (f"<b>Start Time:</b> {self.start_time}, "
+                f"<b>Current Time:</b> {ctime}, "
+                f"<b>Avg Time Gap:</b> {self.avg_time_gap:.3f}")
+        self.gui.additional_table_2.setItem(row, 4, QTableWidgetItem(summ))
         try:
-            file_ctime = os.path.getctime(file)
-        except Exception as e:
-            print(f"Error accessing file time for {file}: {e}")
-            return
-
-        # Prevent duplicates
-        if file_ctime in self.gage_creation_time_array:
-            return
-
-        try:
-            with h5py.File(file, 'r') as h5_file:
-                ch1_data = {}
-                ch3_data = {}
-                for frame in range(3):
-                    ch1_data[f'CH1_frame{frame}'] = np.array(h5_file[f'CH1_frame{frame}'])
-                    ch3_data[f'CH3_frame{frame}'] = np.array(h5_file[f'CH3_frame{frame}'])
-            self.gage_files.append({'CH1': ch1_data, 'CH3': ch3_data})
-            self.gage_creation_time_array.append(file_ctime)
-
-            if len(self.gage_creation_time_array) == 1:
-                self.start_time = file_ctime
-
-            self.rerun_acceptance_gage()
-
-            new_shot_index = len(self.gage_creation_time_array) - 1
-            data_valid = False
-            jkam_space_correct_str = "None"
-
-            if 0 <= new_shot_index < len(self.mask_valid_data):
-                data_valid = self.mask_valid_data[new_shot_index]
-
-            jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-            if new_shot_index in jkam_space_dict:
-                jkam_space_correct_str = str(jkam_space_dict[new_shot_index])
-
-            row_position = self.gui.additional_table_2.rowCount()
-            self.gui.additional_table_2.insertRow(row_position)
-            self.gui.additional_table_2.setItem(row_position, 0, QTableWidgetItem(str(new_shot_index)))
-            self.gui.additional_table_2.setItem(row_position, 1, QTableWidgetItem(file))
-            self.gui.additional_table_2.setItem(row_position, 2, QTableWidgetItem(str(data_valid)))
-            self.gui.additional_table_2.setItem(row_position, 3, QTableWidgetItem(jkam_space_correct_str))
-
-            summary_text = (
-                f"<b>Start Time:</b> {self.start_time}, "
-                f"<b>Current Time:</b> {file_ctime}, "
-                f"<b>Avg Time Gap:</b> {self.avg_time_gap}"
-            )
-            self.gui.additional_table_2.setItem(row_position, 4, QTableWidgetItem(summary_text))
-
             self.update_chart_3()
-
-            self.gui.jkam_h5_file_handler.all_datapoints.append(file_ctime)
-            self.gui.jkam_h5_file_handler.update_fft_plot()
-
+            print("update_chart_3 OK")
         except Exception as e:
-            print(f"Error processing GageScope file {file}: {e}")
-            return
+            print("Chart3 error:", e)
+            traceback.print_exc()
+        try:
+            self.gui.jkam_h5_file_handler.update_fft_plot()
+            print("FFT OK")
+        except Exception as e:
+            print("FFT error:", e)
+            traceback.print_exc()
 
     def rerun_acceptance_gage(self):
-        num_shots = len(self.gage_creation_time_array)
-
-        if len(self.final_accepted) < num_shots:
-            self.final_accepted += [False] * (num_shots - len(self.final_accepted))
-
-        if num_shots <= 1:
-            self.avg_time_gap = 0
-        else:
-            total_span = (self.gage_creation_time_array[-1] - self.gage_creation_time_array[0])
-            self.avg_time_gap = total_span / (num_shots - 1)
-
-        self.mask_valid_data = np.zeros(num_shots, dtype=bool)
-        self.jkam_gage_matchlist = np.full(num_shots, -1, dtype=int)
-        self.color_array = ["r"] * num_shots
-
-        jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-        jkam_time_temp_dict = self.gui.jkam_h5_file_handler.time_temp_dict
-
-        gage_ctimes = np.array(self.gage_creation_time_array)
-        gage_index_list = np.arange(num_shots)
-
-        for shot_num in range(num_shots):
-            if self.final_accepted[shot_num]:
-                self.mask_valid_data[shot_num] = True
-                self.color_array[shot_num] = "g"
+        n = len(self.gage_creation_time_array)
+        if len(self.final_accepted) < n:
+            self.final_accepted += [False] * (n - len(self.final_accepted))
+        self.avg_time_gap = 0 if n <= 1 else (self.gage_creation_time_array[-1] - self.gage_creation_time_array[0]) / (n - 1)
+        self.mask_valid_data = np.zeros(n, dtype=bool)
+        self.jkam_gage_matchlist = np.full(n, -1, dtype=int)
+        self.color_array = ["r"] * n
+        sd = self.gui.jkam_h5_file_handler.shots_dict
+        td = self.gui.jkam_h5_file_handler.time_temp_dict
+        times = np.array(self.gage_creation_time_array)
+        for i in range(n):
+            if self.final_accepted[i]:
+                self.mask_valid_data[i] = True
+                self.color_array[i] = "g"
                 continue
-
-            if shot_num in jkam_time_temp_dict and shot_num in jkam_space_dict:
-                jkam_time = jkam_time_temp_dict[shot_num]
-                space_correct = jkam_space_dict[shot_num]
-
-                if space_correct:
-                    if self.avg_time_gap == 0:
-                        self.mask_valid_data[shot_num] = True
-                        self.color_array[shot_num] = "g"
-                        self.jkam_gage_matchlist[shot_num] = shot_num
-                        self.final_accepted[shot_num] = True
-                    else:
-                        time_diffs = np.abs(gage_ctimes - jkam_time)
-                        min_diff = np.min(time_diffs)
-                        if min_diff <= 0.3 * self.avg_time_gap:
-                            self.mask_valid_data[shot_num] = True
-                            closest_idx = np.argmin(time_diffs)
-                            self.jkam_gage_matchlist[shot_num] = gage_index_list[closest_idx]
-                            self.color_array[shot_num] = "g"
-                            self.final_accepted[shot_num] = True
-                        else:
-                            self.mask_valid_data[shot_num] = False
-                            self.color_array[shot_num] = "r"
-                            if shot_num not in self.gage_error_shots_reported:
-                                print(f"Gage error at shot {shot_num}")
-                                self.gage_error_shots_reported.add(shot_num)
-                else:
-                    self.mask_valid_data[shot_num] = False
-                    self.color_array[shot_num] = "r"
-            else:
-                self.mask_valid_data[shot_num] = False
-                self.jkam_gage_matchlist[shot_num] = -1
-
-        self.cumulative_data = []
-        last_success_count = 0
-        highest_count = 0
-
-        for shot_num in range(num_shots):
-            if self.mask_valid_data[shot_num]:
-                if not self.cumulative_data or self.cumulative_data[-1] == 0:
-                    last_success_count = highest_count + 1
-                else:
-                    last_success_count += 1
-                highest_count = max(highest_count, last_success_count)
-                self.cumulative_data.append(last_success_count)
+            if i in sd and i in td and sd[i]:
+                if self.avg_time_gap == 0 or np.min(np.abs(times - td[i])) <= 0.3 * self.avg_time_gap:
+                    self.mask_valid_data[i] = True
+                    self.jkam_gage_matchlist[i] = i if self.avg_time_gap == 0 else int(np.argmin(np.abs(times - td[i])))
+                    self.color_array[i] = "g"
+                    self.final_accepted[i] = True
+                elif i not in self.gage_error_shots_reported:
+                    print(f"Gage error at shot {i}")
+                    self.gage_error_shots_reported.add(i)
+        self.cumulative_data, last, high = [], 0, 0
+        for ok in self.mask_valid_data:
+            if ok:
+                last = (high + 1) if not self.cumulative_data or self.cumulative_data[-1] == 0 else last + 1
+                high = max(high, last)
+                self.cumulative_data.append(last)
             else:
                 self.cumulative_data.append(0)
 
     def update_chart_3(self):
-        fig = self.gui.figures[3]
-        fig.clear()
+        fig = self.gui.figures[3]; fig.clear()
         ax = fig.add_subplot(111)
-
-        x_vals = np.arange(len(self.cumulative_data))
-        for i, val in enumerate(self.cumulative_data):
-            ax.plot(x_vals[i], val, marker="o", color=self.color_array[i])
-        ax.plot(x_vals, self.cumulative_data, linestyle="-", alpha=0.3)
-
+        x = np.arange(len(self.cumulative_data))
+        for i, v in enumerate(self.cumulative_data):
+            ax.plot(x[i], v, marker='o', color=self.color_array[i])
+        ax.plot(x, self.cumulative_data, linestyle='-', alpha=0.3)
         ax.set_title("Cumulative Accepted Files 3 (GageScope)")
-        ax.set_xlabel("Shot Number")
-        ax.set_ylabel("Cumulative Value")
+        ax.set_xlabel("Shot Number"); ax.set_ylabel("Cumulative Value")
         self.gui.canvases[3].draw()
 
-
-###############################################################################
-#                     Red Pitaya Handler (.txt)                               #
-###############################################################################
+# -------------------- Red Pitaya Handler --------------------
 class RedPitayaFileHandler:
-    """
-    Handles Red Pitaya .txt files with acceptance logic vs. JKAM data.
-    Also contains method to auto-SCP from Red Pitaya into a local folder.
-    """
     def __init__(self, gui):
         self.gui = gui
         self.rp_files = []
         self.rp_times_list = []
-
         self.mask_valid_data_rp = []
         self.jkam_rp_matchlist = []
         self.color_array = []
         self.cumulative_data = []
         self.final_accepted = []
-
         self.cav_contrast = None
         self.perp_contrast = None
         self.cav_hist = None
@@ -727,70 +588,29 @@ class RedPitayaFileHandler:
         self.perp_output = None
         self.cav_phase = None
         self.perp_phase = None
-
-        self.done1 = 0
-        self.done2 = 0
-        self.done3 = 0
-        self.done4 = 0
+        self.done1 = self.done2 = self.done3 = self.done4 = 0
 
     def download_redpitaya_files(self):
-        """
-        Attempt to SSH into the Red Pitaya and SFTP-get the text files into the
-        user-specified local directory. Adjust as needed for your environment.
-        """
-        host = "169.254.13.29"
-        username = "root"
-        password = "root"
-
-        # This is where those files live on the Red Pitaya. Adjust if needed.
-        remote_folder = "/root/RedPitaya/"
-
-        # The files you want to copy over:
-        rp_filenames = [
-            "phicav.txt",
-            "phiperp.txt",
-            "cnstperp.txt",
-            "histcav.txt",
-            "histperp.txt",
-            "lencav.txt",
-            "lenperp.txt",
-            "outcav.txt",
-            "outperp.txt",
-        ]
-
-        # The local destination folder typed into the GUI:
-        local_dir = self.gui.rp_download_dir_edit.text().strip()
-        if not local_dir:
-            print("No local Red Pitaya download directory specified. Skipping download.")
-            return
-
-        # Ensure local directory exists
-        os.makedirs(local_dir, exist_ok=True)
-
-        # Perform SFTP
+        host, username, password = "169.254.13.29", "root", "root"
+        remote = "/root/RedPitaya/"
+        files = ["phicav.txt","phiperp.txt","cnstperp.txt",
+                 "histcav.txt","histperp.txt","lencav.txt",
+                 "lenperp.txt","outcav.txt","outperp.txt"]
+        local = self.gui.rp_download_dir_edit.text().strip()
+        if not local:
+            print("No RP download dir."); return
+        os.makedirs(local, exist_ok=True)
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client = paramiko.SSHClient(); client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(host, username=username, password=password)
-
             sftp = client.open_sftp()
-
-            for fname in rp_filenames:
-                remote_file = os.path.join(remote_folder, fname)
-                local_file = os.path.join(local_dir, fname)
-                #i used print below for debugging but since its happening every 5 shots its gonna be too much so not doing it rn
-                #print(f"Downloading {remote_file} -> {local_file}")
-                sftp.get(remote_file, local_file)
-
-            sftp.close()
-            client.close()
-            # Don't print this below either for same reason as above
-            #print("Successfully downloaded Red Pitaya files.")
+            for fn in files:
+                sftp.get(os.path.join(remote, fn), os.path.join(local, fn))
+            sftp.close(); client.close()
         except Exception as e:
-            print(f"Error downloading from Red Pitaya: {e}")
+            print(f"RP download error: {e}")
 
     def load_data(self, file):
-        """ Helper to load data and ensure it is 2D. """
         try:
             data = np.loadtxt(file, dtype=float, delimiter=',')
             if data.ndim == 1:
@@ -802,71 +622,37 @@ class RedPitayaFileHandler:
 
     def process_file(self, file):
         self.gui.jkam_h5_file_handler.update_settings()
-
         if file in self.rp_files:
             return
-
         if not os.path.exists(file):
-            print(f"File does not exist: {file}")
+            print(f"No such RP file: {file}")
             return
-
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", UserWarning)
-                filename_phase = np.loadtxt(file, dtype=float, delimiter=',')
-        except UserWarning:
-            print(f"Error: Red Pitaya file is empty: {file}")
-            self.rp_files.append(file)
-            self.rp_times_list.append(None)
-            self.rerun_acceptance_rp()
-            return
+                data = np.loadtxt(file, delimiter=',')
         except Exception as e:
-            print(f"Failed to load Red Pitaya file {file}: {e}")
-            self.rp_files.append(file)
-            self.rp_times_list.append(None)
-            self.rerun_acceptance_rp()
-            return
-
-        if filename_phase.size == 0:
-            print(f"Error: Red Pitaya file is empty: {file}")
-            self.rp_files.append(file)
-            self.rp_times_list.append(None)
-            self.rerun_acceptance_rp()
-            return
-        
-        if len(filename_phase.shape) == 1:
-            filename_phase = filename_phase.reshape(1, -1)
-
-        rp_creation_time_array = filename_phase[:, 0]
-
-        self.rp_files.append(file)
-        self.rp_times_list.append(rp_creation_time_array)
+            print(f"Error loading RP file {file}: {e}")
+            self.rp_files.append(file); self.rp_times_list.append(None)
+            self.rerun_acceptance_rp(); return
+        if data.size == 0:
+            print(f"Empty RP file: {file}")
+            self.rp_files.append(file); self.rp_times_list.append(None)
+            self.rerun_acceptance_rp(); return
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        times = data[:, 0]
+        self.rp_files.append(file); self.rp_times_list.append(times)
         self.rerun_acceptance_rp()
-
-        new_shot_index = len(self.rp_files) - 1
-        data_valid = False
-        if 0 <= new_shot_index < len(self.mask_valid_data_rp):
-            data_valid = self.mask_valid_data_rp[new_shot_index]
-
-        jkam_space_correct_str = "None"
-        jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-        if new_shot_index in jkam_space_dict:
-            jkam_space_correct_str = str(jkam_space_dict[new_shot_index])
-
-        row_position = self.gui.additional_table_3.rowCount()
-        self.gui.additional_table_3.insertRow(row_position)
-        self.gui.additional_table_3.setItem(row_position, 0, QTableWidgetItem(str(new_shot_index)))
-        self.gui.additional_table_3.setItem(row_position, 1, QTableWidgetItem(file))
-        self.gui.additional_table_3.setItem(row_position, 2, QTableWidgetItem(str(data_valid)))
-        self.gui.additional_table_3.setItem(row_position, 3, QTableWidgetItem(jkam_space_correct_str))
-
-        info_str = (
-            "No Data"
-            if (rp_creation_time_array is None or len(rp_creation_time_array) == 0)
-            else f"RP Times Count: {len(rp_creation_time_array)}"
-        )
-        self.gui.additional_table_3.setItem(row_position, 4, QTableWidgetItem(info_str))
-
+        idx = len(self.rp_files) - 1
+        valid = idx < len(self.mask_valid_data_rp) and self.mask_valid_data_rp[idx]
+        jstr = str(self.gui.jkam_h5_file_handler.shots_dict.get(idx, "None"))
+        row = self.gui.additional_table_3.rowCount()
+        self.gui.additional_table_3.insertRow(row)
+        for col, val in enumerate([idx, file, valid, jstr]):
+            self.gui.additional_table_3.setItem(row, col, QTableWidgetItem(str(val)))
+        info = ("No Data" if times is None or len(times) == 0 else f"RP Times Count: {len(times)}")
+        self.gui.additional_table_3.setItem(row, 4, QTableWidgetItem(info))
         if 'cnstcav' in file:
             self.cav_contrast = self.load_data(file)
         if 'cnstperp' in file:
@@ -887,297 +673,189 @@ class RedPitayaFileHandler:
             self.cav_phase = self.load_data(file)
         if 'phiperp' in file:
             self.perp_phase = self.load_data(file)
-
         self.update_chart_rp()
         self.update_unique_rp()
 
     def rerun_acceptance_rp(self):
-        num_shots = len(self.rp_files)
-
-        if len(self.final_accepted) < num_shots:
-            self.final_accepted += [False] * (num_shots - len(self.final_accepted))
-
-        self.mask_valid_data_rp = [False] * num_shots
-        self.jkam_rp_matchlist = [-1] * num_shots
-        self.color_array = ["r"] * num_shots
+        n = len(self.rp_files)
+        if len(self.final_accepted) < n:
+            self.final_accepted += [False] * (n - len(self.final_accepted))
+        self.mask_valid_data_rp = [False] * n
+        self.jkam_rp_matchlist = [-1] * n
+        self.color_array = ["r"] * n
         self.cumulative_data = []
-        highest_count = 0
-        last_success_count = 0
-
-        jkam_space_dict = self.gui.jkam_h5_file_handler.shots_dict
-        jkam_time_temp_dict = self.gui.jkam_h5_file_handler.time_temp_dict
-        jkam_avg_time_gap = self.gui.jkam_h5_file_handler.avg_time_gap
-
-        for shot_num in range(num_shots):
-            if self.final_accepted[shot_num]:
-                self.mask_valid_data_rp[shot_num] = True
-                self.color_array[shot_num] = "g"
-                if not self.cumulative_data or self.cumulative_data[-1] == 0:
-                    last_success_count = highest_count + 1
-                else:
-                    last_success_count += 1
-                highest_count = max(highest_count, last_success_count)
-                self.cumulative_data.append(last_success_count)
+        high = last = 0
+        sd = self.gui.jkam_h5_file_handler.shots_dict
+        td = self.gui.jkam_h5_file_handler.time_temp_dict
+        avg_gap = self.gui.jkam_h5_file_handler.avg_time_gap
+        for i in range(n):
+            if self.final_accepted[i]:
+                self.mask_valid_data_rp[i] = True
+                self.color_array[i] = "g"
+                last = high + 1 if not self.cumulative_data or self.cumulative_data[-1] == 0 else last + 1
+                high = max(high, last)
+                self.cumulative_data.append(last)
                 continue
-
-            rp_creation_time_array = self.rp_times_list[shot_num]
-            if rp_creation_time_array is None or len(rp_creation_time_array) == 0:
-                self.mask_valid_data_rp[shot_num] = False
-                self.color_array[shot_num] = "r"
-                self.jkam_rp_matchlist[shot_num] = -1
+            times = self.rp_times_list[i]
+            if times is None or len(times) == 0:
                 self.cumulative_data.append(0)
                 continue
-
-            if (shot_num not in jkam_time_temp_dict) or (shot_num not in jkam_space_dict):
-                self.mask_valid_data_rp[shot_num] = False
-                self.color_array[shot_num] = "r"
-                self.jkam_rp_matchlist[shot_num] = -1
+            if i not in sd or i not in td or not sd[i]:
                 self.cumulative_data.append(0)
                 continue
-
-            time_temp = jkam_time_temp_dict[shot_num]
-            jkam_space_correct = jkam_space_dict[shot_num]
-
-            if jkam_space_correct:
-                rp_index_list = np.arange(len(rp_creation_time_array))
-                min_diff = np.min(np.abs(rp_creation_time_array - time_temp))
-                if (jkam_avg_time_gap != 0) and (min_diff <= 0.3 * jkam_avg_time_gap):
-                    self.mask_valid_data_rp[shot_num] = True
-                    idx = np.argmin(np.abs(rp_creation_time_array - time_temp))
-                    self.jkam_rp_matchlist[shot_num] = rp_index_list[idx]
-                    self.color_array[shot_num] = "g"
-                    self.final_accepted[shot_num] = True
-                    if not self.cumulative_data or self.cumulative_data[-1] == 0:
-                        last_success_count = highest_count + 1
-                    else:
-                        last_success_count += 1
-                    highest_count = max(highest_count, last_success_count)
-                    self.cumulative_data.append(last_success_count)
-                else:
-                    print(f"error at {shot_num}")
-                    self.mask_valid_data_rp[shot_num] = False
-                    self.color_array[shot_num] = "r"
-                    self.jkam_rp_matchlist[shot_num] = -1
-                    self.cumulative_data.append(0)
+            md = np.min(np.abs(times - td[i]))
+            if avg_gap != 0 and md <= 0.3 * avg_gap:
+                self.mask_valid_data_rp[i] = True
+                self.jkam_rp_matchlist[i] = int(np.argmin(np.abs(times - td[i])))
+                self.color_array[i] = "g"
+                self.final_accepted[i] = True
+                last = high + 1 if not self.cumulative_data or self.cumulative_data[-1] == 0 else last + 1
+                high = max(high, last)
+                self.cumulative_data.append(last)
             else:
-                print(f"error at {shot_num}")
-                self.mask_valid_data_rp[shot_num] = False
-                self.color_array[shot_num] = "r"
-                self.jkam_rp_matchlist[shot_num] = -1
+                print(f"RP error at shot {i}")
                 self.cumulative_data.append(0)
 
     def update_chart_rp(self):
-        fig = self.gui.figures[2]
-        fig.clear()
+        fig = self.gui.figures[2]; fig.clear()
         ax = fig.add_subplot(111)
-
-        x_vals = np.arange(len(self.cumulative_data))
-        for i, val in enumerate(self.cumulative_data):
-            ax.plot(x_vals[i], val, marker="o", color=self.color_array[i])
-        ax.plot(x_vals, self.cumulative_data, linestyle="-", alpha=0.3)
-
+        x = np.arange(len(self.cumulative_data))
+        for i, v in enumerate(self.cumulative_data):
+            ax.plot(x[i], v, marker='o', color=self.color_array[i])
+        ax.plot(x, self.cumulative_data, linestyle='-', alpha=0.3)
         ax.set_title("Cumulative Accepted Files (Red Pitaya)")
-        ax.set_xlabel("Shot Number")
-        ax.set_ylabel("Cumulative Value")
+        ax.set_xlabel("Shot Number"); ax.set_ylabel("Cumulative Value")
         self.gui.canvases[2].draw()
 
     def update_unique_rp(self):
         if self.done1 == 0 and self.cav_len is not None and self.perp_len is not None:
-            if self.cav_len.ndim == 2 and self.cav_len.shape[1] >= 2 and \
-               self.perp_len.ndim == 2 and self.perp_len.shape[1] >= 2:
+            if self.cav_len.ndim == 2 and self.perp_len.ndim == 2:
                 self.done1 = 1
-                fig = self.gui.figures[5]
-                fig.clear()
+                fig = self.gui.figures[5]; fig.clear()
                 ax = fig.add_subplot(111)
-                ax.plot(self.cav_len[:, 0], self.cav_len[:, 1], label="cav_len(locked)")
-                ax.plot(self.perp_len[:, 0], self.perp_len[:, 1], label="perp_len(locked)")
+                ax.plot(self.cav_len[:,0], self.cav_len[:,1], label="cav_len")
+                ax.plot(self.perp_len[:,0], self.perp_len[:,1], label="perp_len")
                 ax.legend()
                 self.gui.canvases[5].draw()
-            else:
-                print("Invalid data shape for lencav or lenperp. Skipping graph 5.")
-
         if self.done2 == 0 and self.cav_contrast is not None and self.perp_contrast is not None:
-            if self.cav_contrast.ndim == 2 and self.cav_contrast.shape[1] >= 2 and \
-               self.perp_contrast.ndim == 2 and self.perp_contrast.shape[1] >= 2:
+            if self.cav_contrast.ndim == 2 and self.perp_contrast.ndim == 2:
                 self.done2 = 1
-                fig = self.gui.figures[6]
-                fig.clear()
+                fig = self.gui.figures[6]; fig.clear()
                 ax = fig.add_subplot(111)
-                ax.plot(self.cav_contrast[:, 0], self.cav_contrast[:, 1], label="cav_contrast")
-                ax.plot(self.perp_contrast[:, 0], self.perp_contrast[:, 1], label="perp_contrast")
+                ax.plot(self.cav_contrast[:,0], self.cav_contrast[:,1], label="cav_contrast")
+                ax.plot(self.perp_contrast[:,0], self.perp_contrast[:,1], label="perp_contrast")
                 ax.legend()
                 self.gui.canvases[6].draw()
-            else:
-                print("Invalid data shape for cav_contrast or perp_contrast. Skipping graph 6.")
-
         if self.done3 == 0 and self.cav_output is not None and self.perp_output is not None:
-            if self.cav_output.ndim == 2 and self.cav_output.shape[1] >= 2 and \
-               self.perp_output.ndim == 2 and self.perp_output.shape[1] >= 2:
+            if self.cav_output.ndim == 2 and self.perp_output.ndim == 2:
                 self.done3 = 1
-                fig = self.gui.figures[7]
-                fig.clear()
+                fig = self.gui.figures[7]; fig.clear()
                 ax = fig.add_subplot(111)
-                ax.plot(self.cav_output[:, 0], self.cav_output[:, 1], label="cav_output")
-                ax.plot(self.perp_output[:, 0], self.perp_output[:, 1], label="perp_output")
+                ax.plot(self.cav_output[:,0], self.cav_output[:,1], label="cav_output")
+                ax.plot(self.perp_output[:,0], self.perp_output[:,1], label="perp_output")
                 ax.set_ylim(-1.2, 1.2)
                 ax.legend()
                 self.gui.canvases[7].draw()
-            else:
-                print("Invalid data shape for cav_output or perp_output. Skipping graph 7.")
-
-        num_shot_start = 0
         if self.done4 == 0 and self.cav_phase is not None and self.perp_phase is not None:
-            if self.cav_phase.ndim == 2 and self.cav_phase.shape[1] >= 2 and \
-               self.perp_phase.ndim == 2 and self.perp_phase.shape[1] >= 2:
+            if self.cav_phase.ndim == 2 and self.perp_phase.ndim == 2:
                 self.done4 = 1
-                fig = self.gui.figures[8]
-                fig.clear()
+                fig = self.gui.figures[8]; fig.clear()
                 ax = fig.add_subplot(111)
-                ax.plot(self.cav_phase[:, 0], self.cav_phase[:, 1], label="cav_phase")
-                ax.plot(self.perp_phase[:, 0], self.perp_phase[:, 1], label="perp_phase")
-                ax.axhline(0.11, c='k')
-                ax.axhline(-0.11, c='k')
-                ax.axvline(self.cav_phase[num_shot_start, 0], c='k')
+                ax.plot(self.cav_phase[:,0], self.cav_phase[:,1], label="cav_phase")
+                ax.plot(self.perp_phase[:,0], self.perp_phase[:,1], label="perp_phase")
+                ax.axhline(0.11, c='k'); ax.axhline(-0.11, c='k')
+                ax.axvline(self.cav_phase[0,0], c='k')
                 ax.legend()
                 self.gui.canvases[8].draw()
-            else:
-                print("Invalid data shape for cav_phase or perp_phase. Skipping graph 8.")
 
-
-###############################################################################
-#                           Main GUI (Modified)                               #
-###############################################################################
+# -------------------- Main GUI --------------------
 class FileProcessorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("File Processor GUI")
-        self.setGeometry(100, 100, 1600, 900)
-
+        self.setWindowTitle('File Processor GUI + Atom Analysis')
+        self.setGeometry(100, 100, 1700, 930)
         self.inputs_accepted = False
 
         # Handlers
-        self.jkam_h5_file_handler = JkamH5FileHandler(self)
-        self.gage_h5_file_handler = GageScopeH5FileHandler(self)
-        self.bin_handler = BinFileHandler(self)
-        self.redpitaya_handler = RedPitayaFileHandler(self)
+        self.jkam_h5_file_handler  = JkamH5FileHandler(self)
+        self.gage_h5_file_handler  = GageScopeH5FileHandler(self)
+        self.bin_handler           = BinFileHandler(self)
+        self.redpitaya_handler     = RedPitayaFileHandler(self)
+        self.atom_analysis_handler = AtomAnalysisHandler(self)
 
+        # Central widget & layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_hlayout = QHBoxLayout(self.central_widget)
 
-        # Left Dock: Feature Options
+        # Left Dock
         self.leftDock = QDockWidget("Feature Options", self)
         self.leftDock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.leftDock)
-
-        self.feature_options_widget = QWidget()
-        self.feature_options_layout = QVBoxLayout(self.feature_options_widget)
-
-        # Checkboxes
-        self.time_me_checkbox = QCheckBox("time_me")
-        self.plot_tenth_shot_checkbox = QCheckBox("plot_tenth_shot")
-        self.time_me_checkbox.setChecked(True)
-        self.plot_tenth_shot_checkbox.setChecked(True)
-        self.feature_options_layout.addWidget(self.time_me_checkbox)
-        self.feature_options_layout.addWidget(self.plot_tenth_shot_checkbox)
-
-        # Numeric fields
-        self.het_freq_label = QLabel("het_freq (MHz):")
-        self.het_freq_input = QLineEdit("20.000446")
-        self.feature_options_layout.addWidget(self.het_freq_label)
-        self.feature_options_layout.addWidget(self.het_freq_input)
-
-        self.dds_freq_label = QLabel("dds_freq:")
-        self.dds_freq_input = QLineEdit("10.000223")
-        self.feature_options_layout.addWidget(self.dds_freq_label)
-        self.feature_options_layout.addWidget(self.dds_freq_input)
-
-        self.samp_freq_label = QLabel("samp_freq (MHz):")
-        self.samp_freq_input = QLineEdit("200")
-        self.feature_options_layout.addWidget(self.samp_freq_label)
-        self.feature_options_layout.addWidget(self.samp_freq_input)
-
-        self.averaging_time_label = QLabel("averaging_time (us):")
-        self.averaging_time_input = QLineEdit("0")
-        self.feature_options_layout.addWidget(self.averaging_time_label)
-        self.feature_options_layout.addWidget(self.averaging_time_input)
-
-        self.step_time_label = QLabel("step_time (us):")
-        self.step_time_input = QLineEdit("1")
-        self.feature_options_layout.addWidget(self.step_time_label)
-        self.feature_options_layout.addWidget(self.step_time_input)
-
-        self.filter_time_label = QLabel("filter_time (us):")
-        self.filter_time_input = QLineEdit("5")
-        self.feature_options_layout.addWidget(self.filter_time_label)
-        self.feature_options_layout.addWidget(self.filter_time_input)
-
-        self.voltage_conversion_label = QLabel("voltage_conversion (mV):")
-        self.voltage_conversion_input = QLineEdit("0.0305176")
-        self.feature_options_layout.addWidget(self.voltage_conversion_label)
-        self.feature_options_layout.addWidget(self.voltage_conversion_input)
-
-        self.kappa_label = QLabel("kappa (MHz):")
-        self.kappa_input = QLineEdit("6.9115")
-        self.feature_options_layout.addWidget(self.kappa_label)
-        self.feature_options_layout.addWidget(self.kappa_input)
-
-        self.LO_power_label = QLabel("LO_power (uW):")
-        self.LO_power_input = QLineEdit("314")
-        self.feature_options_layout.addWidget(self.LO_power_label)
-        self.feature_options_layout.addWidget(self.LO_power_input)
-
-        self.PHOTON_ENERGY_label = QLabel("PHOTON_ENERGY:")
-        self.PHOTON_ENERGY_input = QLineEdit("2.55e-19")
-        self.feature_options_layout.addWidget(self.PHOTON_ENERGY_label)
-        self.feature_options_layout.addWidget(self.PHOTON_ENERGY_input)
-
-        self.LO_rate_label = QLabel("LO_rate (count/us):")
-        self.LO_rate_input = QLineEdit("1.23e9")
-        self.feature_options_layout.addWidget(self.LO_rate_label)
-        self.feature_options_layout.addWidget(self.LO_rate_input)
-
-        self.photonrate_conversion_label = QLabel("photonrate_conversion (count/us):")
-        self.photonrate_conversion_input = QLineEdit("9450")
-        self.feature_options_layout.addWidget(self.photonrate_conversion_label)
-        self.feature_options_layout.addWidget(self.photonrate_conversion_input)
-
-        # Window function selector
-        self.window_select_label = QLabel("Window function:")
-        self.window_select = QComboBox()
-        self.window_select.addItems(["hann", "flattop", "square"])
-        self.window_select.setCurrentIndex(0)
-        self.feature_options_layout.addWidget(self.window_select_label)
-        self.feature_options_layout.addWidget(self.window_select)
-
-        # ---------------------- NEW: Field to specify local RP download folder ---
-        self.rp_download_dir_label = QLabel("Red Pitaya Download Folder:")
-        self.rp_download_dir_edit = QLineEdit("C:\\Users\\jayom\\Downloads\\run4\\rp-automatic")
-        self.feature_options_layout.addWidget(self.rp_download_dir_label)
-        self.feature_options_layout.addWidget(self.rp_download_dir_edit)
-        # -------------------------------------------------------------------------
-
-        # Accept Inputs
-        self.accept_button = QPushButton("Accept Inputs")
-        self.accept_button.clicked.connect(self.accept_inputs)
-        self.feature_options_layout.addWidget(self.accept_button)
-
-        self.inputs_status_label = QLabel(
-            "PLEASE ENTER INPUTS (or keep defaults) AND CLICK 'Accept Inputs' TO START!"
-        )
-        self.feature_options_layout.addWidget(self.inputs_status_label)
-        self.feature_options_layout.addStretch()
-        self.feature_options_widget.setLayout(self.feature_options_layout)
-        self.leftDock.setWidget(self.feature_options_widget)
+        self._init_feature_options()
 
         # Right side
         self.right_side_widget = QWidget()
         self.right_side_layout = QVBoxLayout(self.right_side_widget)
         self.main_hlayout.addWidget(self.right_side_widget)
+        self.threadpool = QThreadPool()
 
+        # Tabs
         self.tabs = QTabWidget()
         self.right_side_layout.addWidget(self.tabs)
+        self._init_tabs()
+        self._init_stream_controls()
 
+    def _init_feature_options(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        self.time_me_checkbox = QCheckBox("time_me")
+        self.plot_tenth_shot_checkbox = QCheckBox("plot_tenth_shot")
+        self.time_me_checkbox.setChecked(True)
+        self.plot_tenth_shot_checkbox.setChecked(True)
+        layout.addWidget(self.time_me_checkbox)
+        layout.addWidget(self.plot_tenth_shot_checkbox)
+
+        def fld(lbl, default):
+            l = QLabel(lbl)
+            i = QLineEdit(str(default))
+            layout.addWidget(l)
+            layout.addWidget(i)
+            return i
+
+        self.het_freq_input = fld("het_freq (MHz):", 20.000446)
+        self.dds_freq_input = fld("dds_freq:", 10.000223)
+        self.samp_freq_input = fld("samp_freq (MHz):", 200)
+        self.averaging_time_input = fld("averaging_time (us):", 0)
+        self.step_time_input = fld("step_time (us):", 1)
+        self.filter_time_input = fld("filter_time (us):", 5)
+        self.voltage_conversion_input = fld("voltage_conversion (mV):", 0.0305176)
+        self.kappa_input = fld("kappa (MHz):", 6.9115)
+        self.LO_power_input = fld("LO_power (uW):", 314)
+        self.PHOTON_ENERGY_input = fld("PHOTON_ENERGY:", 2.55e-19)
+        self.LO_rate_input = fld("LO_rate (count/us):", 1.23e9)
+        self.photonrate_conversion_input = fld("photonrate_conversion (count/us):", 9450)
+
+        layout.addWidget(QLabel("Window function:"))
+        self.window_select = QComboBox()
+        self.window_select.addItems(["hann", "flattop", "square"])
+        layout.addWidget(self.window_select)
+
+        layout.addWidget(QLabel("Red Pitaya Download Folder:"))
+        self.rp_download_dir_edit = QLineEdit(os.path.join(os.getcwd(), "rp-automatic"))
+        layout.addWidget(self.rp_download_dir_edit)
+
+        self.accept_button = QPushButton("Accept Inputs")
+        self.accept_button.clicked.connect(self.accept_inputs)
+        layout.addWidget(self.accept_button)
+
+        self.inputs_status_label = QLabel("PLEASE ENTER INPUTS and click 'Accept Inputs'")
+        layout.addWidget(self.inputs_status_label)
+        layout.addStretch()
+        w.setLayout(layout)
+        self.leftDock.setWidget(w)
+
+    def _init_tabs(self):
         # Chart tab
         self.chart_tab = QWidget()
         self.chart_layout = QGridLayout(self.chart_tab)
@@ -1189,133 +867,133 @@ class FileProcessorGUI(QMainWindow):
         self.tabs.addTab(self.table_tab, "JKAM Data")
 
         # FPGA table tab
-        self.additional_table_tab_1 = QWidget()
-        self.additional_table_tab_1_layout = QVBoxLayout(self.additional_table_tab_1)
-        self.tabs.addTab(self.additional_table_tab_1, "FPGA Data")
+        self.fpga_table_tab = QWidget()
+        self.fpga_table_layout = QVBoxLayout(self.fpga_table_tab)
+        self.tabs.addTab(self.fpga_table_tab, "FPGA Data")
 
         # GageScope table tab
-        self.additional_table_tab_2 = QWidget()
-        self.additional_table_tab_2_layout = QVBoxLayout(self.additional_table_tab_2)
-        self.tabs.addTab(self.additional_table_tab_2, "GageScope Data")
+        self.gage_table_tab = QWidget()
+        self.gage_table_layout = QVBoxLayout(self.gage_table_tab)
+        self.tabs.addTab(self.gage_table_tab, "GageScope Data")
 
         # Red Pitaya table tab
-        self.additional_table_tab_3 = QWidget()
-        self.additional_table_tab_3_layout = QVBoxLayout(self.additional_table_tab_3)
-        self.tabs.addTab(self.additional_table_tab_3, "Red Pitaya Data")
+        self.rp_table_tab = QWidget()
+        self.rp_table_layout = QVBoxLayout(self.rp_table_tab)
+        self.tabs.addTab(self.rp_table_tab, "Red Pitaya Data")
 
         # FFT Graph tab
         self.fft_tab = QWidget()
-        self.fft_tab_layout = QVBoxLayout(self.fft_tab)
+        self.fft_layout = QVBoxLayout(self.fft_tab)
         self.tabs.addTab(self.fft_tab, "FFT Graph")
 
-        # Red Pitaya Visualizations Tab
-        self.rp_tab = QWidget()
-        self.rp_tab_layout = QGridLayout(self.rp_tab)
-        self.tabs.addTab(self.rp_tab, "Red Pitaya Graphs")
+        # Red Pitaya Graphs tab
+        self.rp_graph_tab = QWidget()
+        self.rp_graph_layout = QGridLayout(self.rp_graph_tab)
+        self.tabs.addTab(self.rp_graph_tab, "Red Pitaya Graphs")
 
-        # FPGA Visualizations Tab
-        self.fpga_tab = QWidget()
-        self.fpga_tab_layout = QVBoxLayout(self.fpga_tab)
-        self.tabs.addTab(self.fpga_tab, "FPGA Graphs")
+        # FPGA Graphs tab
+        self.fpga_graph_tab = QWidget()
+        self.fpga_graph_layout = QVBoxLayout(self.fpga_graph_tab)
+        self.tabs.addTab(self.fpga_graph_tab, "FPGA Graphs")
+
+        # Atom Analysis tab
+        self.atom_tab = QWidget()
+        self.atom_layout = QVBoxLayout(self.atom_tab)
+        self.tabs.addTab(self.atom_tab, "Atom Analysis")
 
         # JKAM table
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Shot Number", "File Name", "Accepted", "Summary Statistics"])
+        self.table.setHorizontalHeaderLabels(
+            ["Shot Number", "File Name", "Accepted", "Summary Statistics"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table_layout.addWidget(self.table)
-
-        # Button in JKAM table tab
-        self.add_file_button_table = QPushButton("Add Files")
-        self.add_file_button_table.clicked.connect(self.add_files)
-        self.table_layout.addWidget(self.add_file_button_table)
+        btn_table = QPushButton("Add Files")
+        btn_table.clicked.connect(self.add_files)
+        self.table_layout.addWidget(btn_table)
 
         # FPGA table
         self.additional_table_1 = QTableWidget()
         self.additional_table_1.setColumnCount(5)
-        self.additional_table_1.setHorizontalHeaderLabels([
-            "Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"
-        ])
+        self.additional_table_1.setHorizontalHeaderLabels(
+            ["Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"]
+        )
         self.additional_table_1.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.additional_table_1.horizontalHeader().setStretchLastSection(True)
-        self.additional_table_tab_1_layout.addWidget(self.additional_table_1)
+        self.fpga_table_layout.addWidget(self.additional_table_1)
 
         # GageScope table
         self.additional_table_2 = QTableWidget()
         self.additional_table_2.setColumnCount(5)
-        self.additional_table_2.setHorizontalHeaderLabels([
-            "Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"
-        ])
+        self.additional_table_2.setHorizontalHeaderLabels(
+            ["Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"]
+        )
         self.additional_table_2.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.additional_table_2.horizontalHeader().setStretchLastSection(True)
-        self.additional_table_tab_2_layout.addWidget(self.additional_table_2)
+        self.gage_table_layout.addWidget(self.additional_table_2)
 
         # Red Pitaya table
         self.additional_table_3 = QTableWidget()
         self.additional_table_3.setColumnCount(5)
-        self.additional_table_3.setHorizontalHeaderLabels([
-            "Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"
-        ])
+        self.additional_table_3.setHorizontalHeaderLabels(
+            ["Shot Number", "File Name", "Accepted", "JKAM Space Correct", "Summary Statistics"]
+        )
         self.additional_table_3.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.additional_table_3.horizontalHeader().setStretchLastSection(True)
-        self.additional_table_tab_3_layout.addWidget(self.additional_table_3)
+        self.rp_table_layout.addWidget(self.additional_table_3)
 
-        # Set up 10 figures
-        self.figures = [Figure() for _ in range(10)]
-        self.canvases = [FigureCanvas(fig) for fig in self.figures]
+        # Figures & canvases
+        self.figures = [Figure() for _ in range(11)]
+        self.canvases = [FigureCanvas(f) for f in self.figures]
 
+        # Place charts
         self.chart_layout.addWidget(self.canvases[0], 0, 0)
         self.chart_layout.addWidget(self.canvases[1], 0, 1)
         self.chart_layout.addWidget(self.canvases[2], 1, 0)
         self.chart_layout.addWidget(self.canvases[3], 1, 1)
+        btn_charts = QPushButton("Add Files")
+        btn_charts.clicked.connect(self.add_files)
+        self.chart_layout.addWidget(btn_charts, 2, 0, 1, 2)
 
-        self.add_file_button_charts = QPushButton("Add Files")
-        self.add_file_button_charts.clicked.connect(self.add_files)
-        self.chart_layout.addWidget(self.add_file_button_charts, 2, 0, 1, 2)
+        # FFT
+        self.fft_layout.addWidget(self.canvases[4])
 
-        self.fft_tab_layout.addWidget(self.canvases[4])
+        # RP graphs
+        self.rp_graph_layout.addWidget(self.canvases[5], 0, 0)
+        self.rp_graph_layout.addWidget(self.canvases[6], 0, 1)
+        self.rp_graph_layout.addWidget(self.canvases[7], 1, 0)
+        self.rp_graph_layout.addWidget(self.canvases[8], 1, 1)
 
-        self.rp_tab_layout.addWidget(self.canvases[5], 0, 0)
-        self.rp_tab_layout.addWidget(self.canvases[6], 0, 1)
-        self.rp_tab_layout.addWidget(self.canvases[7], 1, 0)
-        self.rp_tab_layout.addWidget(self.canvases[8], 1, 1)
+        # FPGA graph
+        self.fpga_graph_layout.addWidget(self.canvases[9])
 
-        self.fpga_tab_layout.addWidget(self.canvases[9])
+        # Atom analysis
+        self.atom_layout.addWidget(self.canvases[10])
+        ax_atom = self.figures[10].add_subplot(111)
+        ax_atom.set_title('Per-Tweezer Metrics (Rolling)')
+        ax_atom.set_xlabel('Tweezer Freq (MHz)')
+        ax_atom.set_ylabel('Probability / Brightness×1e3')
+        self.canvases[10].draw()
 
-        self.initialize_plot(0, "Cumulative Accepted Files 1 (JKAM)")
-        self.initialize_plot(1, "Cumulative Accepted Files 2 (Bin/FPGA)")
-        self.initialize_plot(2, "Cumulative Accepted Files (Red Pitaya)")
-        self.initialize_plot(3, "Cumulative Accepted Files 3 (GageScope)")
-        self.initialize_fft_plot(4)
-
-        self.initialize_rp_plot(5)
-        self.initialize_rp_plot(6)
-        self.initialize_rp_plot(7)
-        self.initialize_rp_plot(8)
-
-        self.initialize_fpga_plot(9)
-
+    def _init_stream_controls(self):
         self.stream_controls_layout = QHBoxLayout()
         self.stream_dir_label = QLabel("Stream Directory:")
         self.stream_dir_edit = QLineEdit(os.getcwd())
         self.stream_start_button = QPushButton("Start Stream")
         self.stream_stop_button = QPushButton("Stop Stream")
         self.stream_status_label = QLabel("Not streaming")
-        self.stream_controls_layout.addWidget(self.stream_dir_label)
-        self.stream_controls_layout.addWidget(self.stream_dir_edit)
-        self.stream_controls_layout.addWidget(self.stream_start_button)
-        self.stream_controls_layout.addWidget(self.stream_stop_button)
-        self.stream_controls_layout.addWidget(self.stream_status_label)
+        for w in [self.stream_dir_label, self.stream_dir_edit,
+                  self.stream_start_button, self.stream_stop_button,
+                  self.stream_status_label]:
+            self.stream_controls_layout.addWidget(w)
         self.right_side_layout.addLayout(self.stream_controls_layout)
-
         self.stream_timer = QTimer()
         self.stream_timer.setInterval(2000)
         self.stream_timer.timeout.connect(self.check_for_new_files)
-
         self.stream_start_button.clicked.connect(self.start_stream)
         self.stream_stop_button.clicked.connect(self.stop_stream)
-
         self.stream_processed_files = set()
 
     def accept_inputs(self):
@@ -1325,87 +1003,46 @@ class FileProcessorGUI(QMainWindow):
             self.voltage_conversion_input, self.kappa_input, self.LO_power_input,
             self.PHOTON_ENERGY_input, self.LO_rate_input, self.photonrate_conversion_input
         ]
-        for field in fields:
-            if field.text().strip() == "":
-                print("Please fill in all inputs before accepting.")
+        for f in fields:
+            if f.text().strip() == "":
+                print("Please fill all inputs before accepting.")
                 self.inputs_accepted = False
                 return
-
         self.inputs_accepted = True
         self.inputs_status_label.setText("Inputs accepted! You may now add/stream files.")
-        print("Inputs accepted! You may now use the rest of the GUI.")
-
-    def initialize_plot(self, index, title_str):
-        ax = self.figures[index].add_subplot(111)
-        ax.plot([], [])
-        ax.set_title(title_str)
-        ax.set_xlabel("Shot Number")
-        ax.set_ylabel("Cumulative Value")
-        self.canvases[index].draw()
-
-    def initialize_rp_plot(self, index):
-        ax = self.figures[index].add_subplot(111)
-        ax.plot([], [])
-        ax.set_title("Cav & Perp Phase Locks")
-        self.canvases[index].draw()
-
-    def initialize_fft_plot(self, index):
-        ax = self.figures[index].add_subplot(111)
-        ax.plot([], [])
-        ax.set_title("FFT of the Signal")
-        ax.set_xlabel("Frequency")
-        ax.set_ylabel("Amplitude")
-        self.canvases[index].draw()
-
-    def initialize_fpga_plot(self, index):
-        ax = self.figures[index].add_subplot(111)
-        ax.plot([], [])
-        ax.set_title("FPGA Atom Input Times")
-        ax.set_xlabel("Time (us)")
-        ax.set_ylabel("Atoms In (Y/N)")
-        self.canvases[index].draw()
+        print("Inputs accepted!")
 
     def add_files(self):
         if not self.inputs_accepted:
-            print("Please fill in all inputs (or defaults) and click 'Accept Inputs' first.")
+            print("Please fill in all inputs and click 'Accept Inputs' first.")
             return
-
         files, _ = QFileDialog.getOpenFileNames(self, "Select Files", "", "All Files (*.*)")
-        if not files:
-            return
+        for f in files:
+            self._process_one_file(f)
 
-        for file in files:
-            self.process_one_file(file)
-
-    def process_one_file(self, file):
+    def _process_one_file(self, file):
         self.jkam_h5_file_handler.update_settings()
-
-        file_extension = os.path.splitext(file)[-1].lower()
-        fname_lower = os.path.basename(file).lower()
-
-        if file_extension == ".h5":
-            if "jkam" in fname_lower:
-                self.jkam_h5_file_handler.process_file(file)
-            elif "gage" in fname_lower:
-                self.gage_h5_file_handler.process_file(file)
-            else:
-                print(f"Unsupported .h5 file (not recognized as JKAM or GageScope). Skipping: {file}")
-        elif file_extension == ".bin":
+        ext = os.path.splitext(file)[-1].lower()
+        name = os.path.basename(file).lower()
+        if ext == '.h5' and 'jkam' in name:
+            self.jkam_h5_file_handler.process_file(file)
+        elif ext == '.h5' and 'gage' in name:
+            self.gage_h5_file_handler.process_file(file)
+        elif ext == '.bin':
             self.bin_handler.process_file(file)
-        elif file_extension == ".txt":
+        elif ext == '.txt':
             self.redpitaya_handler.process_file(file)
         else:
-            print(f"Unsupported file extension '{file_extension}' - skipping: {file}")
+            print(f"Unsupported file: {file}")
 
     def start_stream(self):
         if not self.inputs_accepted:
-            print("Please fill in all inputs (or defaults) and click 'Accept Inputs' first.")
+            print("Please fill in all inputs first.")
             return
-
         self.stream_processed_files.clear()
         self.stream_timer.start()
         self.stream_status_label.setText("Streaming has started!")
-        print("Stream started. Monitoring directory:", self.stream_dir_edit.text())
+        print("Stream started:", self.stream_dir_edit.text())
 
     def stop_stream(self):
         self.stream_timer.stop()
@@ -1415,29 +1052,19 @@ class FileProcessorGUI(QMainWindow):
     def check_for_new_files(self):
         if not self.inputs_accepted:
             return
-
-        watch_dir = self.stream_dir_edit.text()
-        if not os.path.isdir(watch_dir):
-            print(f"Invalid stream directory: {watch_dir}")
+        d = self.stream_dir_edit.text()
+        if not os.path.isdir(d):
+            print(f"Invalid stream dir: {d}")
             return
-
-        subfolders = sorted(
-            d for d in os.listdir(watch_dir)
-            if os.path.isdir(os.path.join(watch_dir, d))
-        )
-
-        for subfolder in subfolders:
-            subfolder_path = os.path.join(watch_dir, subfolder)
-            folder_files = sorted(
-                os.path.join(subfolder_path, f)
-                for f in os.listdir(subfolder_path)
-                if os.path.isfile(os.path.join(subfolder_path, f))
-            )
-
-            new_files = [f for f in folder_files if f not in self.stream_processed_files]
-            for nf in new_files:
-                self.process_one_file(nf)
-                self.stream_processed_files.add(nf)
+        for sub in sorted(os.listdir(d)):
+            sp = os.path.join(d, sub)
+            if not os.path.isdir(sp):
+                continue
+            for fn in sorted(os.listdir(sp)):
+                fp = os.path.join(sp, fn)
+                if fp not in self.stream_processed_files:
+                    self._process_one_file(fp)
+                    self.stream_processed_files.add(fp)
 
     def closeEvent(self, event):
         self.cleanup()
@@ -1449,12 +1076,8 @@ class FileProcessorGUI(QMainWindow):
         self.bin_handler.bin_files.clear()
         self.redpitaya_handler.rp_files.clear()
 
-
-###############################################################################
-#                               Main Run                                      #
-###############################################################################
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    main_window = FileProcessorGUI()
-    main_window.show()
+    window = FileProcessorGUI()
+    window.show()
     sys.exit(app.exec_())
