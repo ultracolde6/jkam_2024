@@ -1,5 +1,5 @@
-#4/29 version iwth atom survival/brightness plots - revert back to 3/13 or 2/19 versions if doesn't work cause this one only tested locally and unsure if outputs are correct at all
-#Prev one was 3/13 Red Pitaya atomatic file ingestion Integration - hopefully works only tested locally - if not revert to prev (2/19?) version 
+#4/29 version 2 with atom survival/brightness plots and trap loadings - revert back to 3/13 or 2/19 versions if doesn't work cause this one only tested locally and unsure if outputs are correct at all
+#Prev one was 3/13 Red Pitaya atomatic file ingestion Integration - hopefully works only tested locally - (2/19?) was more basic working version 
 import sys
 import time
 import os
@@ -53,6 +53,10 @@ class AtomAnalysisHandler:
         self._history = []
 
     def add_shot(self, brightness_tensor: np.ndarray):
+        # updating the trap‐status table in real time (am uisng the first frame as "loaded" indicator)
+        exists = brightness_tensor[0, :] > self.upper_threshold_mat[0]
+        self.gui.update_trap_table(exists.astype(int))
+
         if brightness_tensor.shape != (self.num_frames, self.num_tweezers):
             print("[AtomAnalysis] bad tensor shape", brightness_tensor.shape)
             return
@@ -106,7 +110,6 @@ class Worker(QRunnable):
     def __init__(self, fn, *args, **kwargs):
         super().__init__()
         self.fn, self.args, self.kwargs = fn, args, kwargs
-
     @pyqtSlot()
     def run(self):
         self.fn(*self.args, **self.kwargs)
@@ -161,16 +164,12 @@ class JkamH5FileHandler:
             return
         if file in self.jkam_files:
             return
-
         # Validate HDF5
         try:
-            with h5py.File(file, 'r'):
-                pass
+            with h5py.File(file, 'r'): pass
         except Exception as e:
             print(f"Error processing JKAM file {file}: {e}")
             return
-
-        # Compute counts & brightness
         num_tweezers = len(self.gui.atom_analysis_handler.tweezer_freq_list)
         num_frames = 3
         counts = np.zeros((num_frames, num_tweezers))
@@ -188,16 +187,13 @@ class JkamH5FileHandler:
             print(f"Error computing counts for {file}: {e}")
             traceback.print_exc()
             return
-
         brightness = np.zeros_like(counts)
         for f in range(num_frames-1):
             brightness[f, :] = counts[f, :] - counts[-1, :]
         brightness[-1, :] = counts[-1, :]
-
         # Register shot
         self.jkam_files.append(file)
         self.jkam_creation_time_array.append(file_ctime)
-
         if self.shots_num == 0:
             self.start_time = file_ctime
             self.shots_dict[0] = True
@@ -208,9 +204,7 @@ class JkamH5FileHandler:
             space_ok = abs(prev - gap) <= 0.2 * gap
             self.shots_dict[self.shots_num] = space_ok
             self.avg_time_gap = gap
-
         self.time_temp_dict[self.shots_num] = file_ctime
-
         if self.shots_num == 0 or self.shots_dict[self.shots_num]:
             val = (self.cumulative_data[self.last_passed_idx] + 1) if self.cumulative_data else 1
             self.cumulative_data.append(val)
@@ -218,10 +212,8 @@ class JkamH5FileHandler:
                 self.last_passed_idx = self.shots_num
         else:
             self.cumulative_data.append(0)
-
         self.shots_num += 1
         self.all_datapoints.append(file_ctime)
-
         row = self.gui.table.rowCount()
         self.gui.table.insertRow(row)
         self.gui.table.setItem(row, 0, QTableWidgetItem(str(self.shots_num - 1)))
@@ -231,13 +223,10 @@ class JkamH5FileHandler:
                    f"<b>Current Time:</b> {file_ctime}, "
                    f"<b>Avg Time Gap:</b> {self.avg_time_gap:.3f}")
         self.gui.table.setItem(row, 3, QTableWidgetItem(summary))
-
         self.update_cumulative_plot()
         self.update_fft_plot()
-
-        # Feed to atom analysis
         self.gui.atom_analysis_handler.add_shot(brightness)
-
+        # download RP files automatically BUT MAY HAVE TO COMMENT OUT NEXT 2 LINES IF TESTING LOCALLY WHILE NOT CONNECTED TO RED PITAYA
         if self.shots_num % 5 == 0:
             self.gui.redpitaya_handler.download_redpitaya_files()
 
@@ -311,7 +300,8 @@ class JkamH5FileHandler:
             ax.set_title("FFT Magnitude (Segment 0)")
             self.gui.canvases[4].draw()
         except Exception as e:
-            print("Exception in update_fft_plot:", e); traceback.print_exc()
+            print("Exception in update_fft_plot:", e)
+            traceback.print_exc()
 
 # -------------------- FPGA / Bin Handler --------------------
 class BinFileHandler:
@@ -901,6 +891,18 @@ class FileProcessorGUI(QMainWindow):
         self.atom_layout = QVBoxLayout(self.atom_tab)
         self.tabs.addTab(self.atom_tab, "Atom Analysis")
 
+        # Trap Status tb
+        self.trap_tab = QWidget()
+        self.trap_layout = QVBoxLayout(self.trap_tab)
+        self.trap_table = QTableWidget()
+        self.trap_table.setColumnCount(2)
+        self.trap_table.verticalHeader().setVisible(False)
+        self.trap_table.setHorizontalHeaderLabels(["Trap Number", "Loaded"])
+        self.trap_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.trap_table.horizontalHeader().setStretchLastSection(True)
+        self.trap_layout.addWidget(self.trap_table)
+        self.tabs.addTab(self.trap_tab, "Trap Status")
+
         # JKAM table
         self.table = QTableWidget()
         self.table.setColumnCount(4)
@@ -996,6 +998,13 @@ class FileProcessorGUI(QMainWindow):
         self.stream_stop_button.clicked.connect(self.stop_stream)
         self.stream_processed_files = set()
 
+    def update_trap_table(self, loaded_array):
+        n = len(loaded_array)
+        self.trap_table.setRowCount(n)
+        for i in range(n):
+            self.trap_table.setItem(i, 0, QTableWidgetItem(str(i)))
+            self.trap_table.setItem(i, 1, QTableWidgetItem("1" if loaded_array[i] else "0"))
+
     def accept_inputs(self):
         fields = [
             self.het_freq_input, self.dds_freq_input, self.samp_freq_input,
@@ -1037,7 +1046,7 @@ class FileProcessorGUI(QMainWindow):
 
     def start_stream(self):
         if not self.inputs_accepted:
-            print("Please fill in all inputs first.")
+            print("Please fill in all inputs before starting stream.")
             return
         self.stream_processed_files.clear()
         self.stream_timer.start()
