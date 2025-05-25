@@ -79,14 +79,16 @@ class AtomAnalysisHandler:
         bright_err = np.full(self.num_tweezers, np.nan)
 
         for tw in range(self.num_tweezers):
-            mask = np.logical_and(existence[:,0,tw], existence[:,1,tw])
-            loaded = np.sum(existence[:,0,tw])
+            loaded_mask  = existence[:, 0, tw]                    
+            survive_mask = np.logical_and(loaded_mask, existence[:, 1, tw])  
+
+            loaded = loaded_mask.sum()
             if loaded > 0:
-                surv_val = np.count_nonzero(mask) / loaded
+                surv_val     = survive_mask.sum() / loaded
                 survival[tw] = surv_val
                 surv_err[tw] = np.sqrt(surv_val * (1 - surv_val) / loaded)
-                brightness[tw] = np.nanmean(arr[:,0,tw][mask])
-                bright_err[tw] = np.nanstd(arr[:,0,tw][mask])
+                brightness[tw] = np.nanmean(arr[:, 0, tw][loaded_mask])
+                bright_err[tw] = np.nanstd(arr[:, 0, tw][loaded_mask])
 
         loading = np.sum(existence[:,0,:], axis=0) / N
         self._draw(survival, surv_err, loading, brightness, bright_err)
@@ -188,9 +190,9 @@ class JkamH5FileHandler:
             traceback.print_exc()
             return
         brightness = np.zeros_like(counts)
-        for f in range(num_frames-1):
-            brightness[f, :] = counts[f, :] - counts[-1, :]
-        brightness[-1, :] = counts[-1, :]
+        brightness[0, :] = counts[0, :]
+        for f in range(1, num_frames):
+            brightness[f, :] = counts[f, :] - counts[0, :]
         # Register shot
         self.jkam_files.append(file)
         self.jkam_creation_time_array.append(file_ctime)
