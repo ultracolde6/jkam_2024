@@ -47,7 +47,7 @@ class AtomAnalysisHandler:
         self.num_frames = 3
         self.tweezer_freq_list = 88 + 0.8 * np.arange(40)
         self.num_tweezers = len(self.tweezer_freq_list)
-        thresh = 400 * np.ones(self.num_tweezers)
+        thresh = 101 * np.ones(self.num_tweezers)
         self.upper_threshold_mat = [thresh] * self.num_frames
         self._buffer = []
         self._history = []
@@ -189,10 +189,11 @@ class JkamH5FileHandler:
             print(f"Error computing counts for {file}: {e}")
             traceback.print_exc()
             return
+        bg = counts[-1,:]
         brightness = np.zeros_like(counts)
         brightness[0, :] = counts[0, :]
-        for f in range(1, num_frames):
-            brightness[f, :] = counts[f, :] - counts[0, :]
+        for f in range(num_frames):
+            brightness[f, :] = counts[f, :] - bg
         # Register shot
         self.jkam_files.append(file)
         self.jkam_creation_time_array.append(file_ctime)
