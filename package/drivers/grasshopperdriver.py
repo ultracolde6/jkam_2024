@@ -1,5 +1,6 @@
 import numpy as np
 import PySpin
+from PyQt5.QtWidgets import QMessageBox
 from package.drivers.jkamgendriver import JKamGenDriver
 
 
@@ -85,7 +86,7 @@ class GrasshopperDriver(JKamGenDriver):
             image_result.Release()
             return frame
         except PySpin.SpinnakerException:
-            pass
+            QMessageBox.critical(None, "Error", "Failed to grab frame from camera.")
 
     @staticmethod
     def _load_default_settings(cam):

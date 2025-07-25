@@ -1,3 +1,10 @@
+"""
+Smart 2D Gaussian Fitting
+
+Provides advanced 2D Gaussian fitting with automatic parameter estimation,
+confidence intervals, and background subtraction for image analysis.
+"""
+
 import numpy as np
 import scipy.ndimage
 import scipy.stats
@@ -6,6 +13,21 @@ from scipy.special import erf
 
 
 def gaussian_2d(x, y, x0=0, y0=0, sx=1, sy=1, amp=1, offset=0, angle=0, x_slope=0, y_slope=0):
+    """
+    2D Gaussian function with optional rotation and linear background.
+    
+    Args:
+        x, y: Coordinate arrays
+        x0, y0: Center coordinates
+        sx, sy: Standard deviations
+        amp: Amplitude
+        offset: Background offset
+        angle: Rotation angle in degrees
+        x_slope, y_slope: Linear background slopes
+        
+    Returns:
+        ndarray: 2D Gaussian function values
+    """
     angle_rad = np.radians(angle)
     rx = np.cos(angle_rad) * (x - x0) + np.sin(angle_rad) * (y - y0)
     ry = -np.sin(angle_rad) * (x - x0) + np.cos(angle_rad) * (y - y0)
@@ -14,6 +36,18 @@ def gaussian_2d(x, y, x0=0, y0=0, sx=1, sy=1, amp=1, offset=0, angle=0, x_slope=
 
 
 def img_moments(img):
+    """
+    Calculate image moments for initial parameter estimation.
+    
+    Args:
+        img: Input image
+        
+    Returns:
+        tuple: (x0, y0, sx, sy) center and standard deviations
+        
+    Raises:
+        ValueError: If image is too noisy for moment calculation
+    """
     y_inds, x_inds = np.indices(img.shape)
     tot = np.nansum(img)
     if tot <= 0:
@@ -32,6 +66,16 @@ def img_moments(img):
 
 
 def get_guess_values(img, quiet=True):
+    """
+    Generate initial parameter guesses for Gaussian fitting.
+    
+    Args:
+        img: Input image
+        quiet: Suppress output messages
+        
+    Returns:
+        ndarray: Initial parameter guesses [x0, y0, sx, sy, amp, offset]
+    """
     x_range = img.shape[1]
     y_range = img.shape[0]
     amp_guess = np.nanmax(img) - np.nanmin(img)
@@ -53,6 +97,19 @@ def get_guess_values(img, quiet=True):
 
 
 def make_fit_param_dict(name, val, std, conf_level=erf(1 / np.sqrt(2)), dof=None):
+    """
+    Create parameter dictionary with confidence intervals.
+    
+    Args:
+        name: Parameter name
+        val: Fitted value
+        std: Standard deviation
+        conf_level: Confidence level
+        dof: Degrees of freedom
+        
+    Returns:
+        dict: Parameter dictionary with error estimates
+    """
     pdict = {'name': name, 'val': val, 'std': std, 'conf_level': conf_level}
     if dof is None:  # Assume normal distribution if dof not specified
         tcrit = scipy.stats.norm.ppf((1 + conf_level) / 2)
@@ -66,6 +123,19 @@ def make_fit_param_dict(name, val, std, conf_level=erf(1 / np.sqrt(2)), dof=None
 
 
 def create_fit_struct(img, popt_dict, pcov, conf_level, dof):
+    """
+    Create comprehensive fit result structure.
+    
+    Args:
+        img: Original image
+        popt_dict: Fitted parameters
+        pcov: Parameter covariance matrix
+        conf_level: Confidence level
+        dof: Degrees of freedom
+        
+    Returns:
+        dict: Complete fit structure with parameters and statistics
+    """
     y_coords, x_coords = np.indices(img.shape)
     model_img = gaussian_2d(x_coords, y_coords, **popt_dict)
     fit_struct = dict()
@@ -89,84 +159,22 @@ def create_fit_struct(img, popt_dict, pcov, conf_level, dof):
 def fit_gaussian2d(img, zoom=1.0, angle_offset=0.0, fix_lin_slope=False, fix_angle=False,
                    conf_level=erf(1 / np.sqrt(2)), quiet=True):
     """
-    2D Gaussian fit to an image
-
-    Guassian fitting algorithm operates by taking an input image img, extracting a guess for initial fit parameters
-    and then performing a Gaussian fit. The initial guess is either based on the mean and variance of img or the image
-    size. There are options to fit or constrain the tilt angle of the ellipse and a 2D linear sloping background.
-    Returns a fit_struct dictionary object which contains some detailed information about the fit including the
-    fit value, standard deviation, and confidence intervals for all fit parameters.
-
-    :param img: 2D Image to fit
-    :param zoom: Decimate rate to speed up fitting if downsample is selected
-    :param angle_offset: (degrees) Central value about which tilt angle is expected to scatter. Output values for
-                         angle will be +- 45 deg. Fits with tilt angle near the edge of this range may swap sx and sy
-                         for similar looking images
-    :param fix_lin_slope: Flag to indicate if a fit should constrain linear background to zero
-    :param fix_angle: Flag to indicate if fit should constrain tilt angle to zero degree
-    :param conf_level: Confidence level for confidence intervals
-    :param quiet: Squelch variable
-
-    :return fit_struct: Returns a struct containing relevant data output of the fit routine
-    :rtype dict
-
-    Returns
-    _______
-    `fit_struct` dictionary with the following keys defined:
-
-    x0 : dict
-        fit_param_dict for fit center x-coordinate
-    y0 : dict
-        fit_param_dict for fit center y-coordinate
-    sx : dict
-        fit_param_dict for fit standard deviation in x-coordinate
-    sy : dict
-        fit_param_dict for fit standard deviation in y-coordinate
-    A : dict
-        fit_param_dict for fit amplitude
-    offset : dict
-        fit_param_dict for background offset
-    theta (optionally) : dict
-        fit_param dict for tilt angle (degrees). Constrained to angle_offset +- 45 deg
-        enabled if fix_tilt_angle=False
-    x_slope (optionally) : dict
-        fit_param_dict for linear slope in x-coordinate. enabled if fix_lin_slope=False
-    y_slope (optionally) : dict
-        fit_param_dict for linear slope in y-coordinate. enabled if fix_lin_slope=False
-    cov : ndarray
-        Covariance matrix estimated from fit Jacobian
-    data_img: ndarray
-        Copy of input image, img
-    model_img: ndarray
-        Image representing the best fit to img using 2D Gaussian model
-    NGauss: float
-        Total area under Gaussian fit model (assuming infinite range, not restricted to image area even if Gaussian
-        variance is much larger than image size
-    NSum: float
-        Integrated sum of all pixel values in original image
-    NSum_BGsubtract: float
-        Subtract off fitted background from NSum: NSum - offset. NSum - offset.
-
-    fit_param_dict
-    _______
-    fit_param_dict are dictionaries carries information about individual fit parameters with the following keys
-    defined:
-    name : str
-        parameter name
-    val : float
-        central fit value for parameter
-    std : float
-        standard deviation of fit extracted from fit Jacobian matrix
-    conf_level : float
-        confidence level for fit parameter confidence interval
-    err_half_range : float
-        Half the size of the confidence interval
-    err_full_range : float
-        Full size of the confidence interval
-    val_lb : float
-        Lower limit of confidence interval
-    val_ub : float
-        Upper limit of confidence interval
+    2D Gaussian fit to an image with automatic parameter estimation.
+    
+    Performs 2D Gaussian fitting with optional rotation and linear background.
+    Returns comprehensive fit results including confidence intervals.
+    
+    Args:
+        img: 2D image to fit
+        zoom: Decimation factor for speed
+        angle_offset: Expected angle center in degrees
+        fix_lin_slope: Fix linear background to zero
+        fix_angle: Fix rotation angle to zero
+        conf_level: Confidence level for intervals
+        quiet: Suppress output messages
+        
+    Returns:
+        dict: Complete fit structure with parameters and statistics
     """
     img = np.nan_to_num(img)
     # img_downsampled = scipy.ndimage.interpolation.zoom(img, 1 / zoom)

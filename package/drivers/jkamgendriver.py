@@ -9,9 +9,10 @@ class FrameGrabber(QThread):
         self.max_fps = max_fps
 
     def run(self):
-        while self.driver.acquiring:
+        while self.driver.acquiring and not self.isInterruptionRequested():
             self.driver.grab_frame()
-            self.wait(int(1 / self.max_fps * 1e3)) # Slow down frame rate to self.max_fps to give GUI time to update
+            # Use msleep instead of wait to avoid thread conflicts
+            self.msleep(int(1 / self.max_fps * 1e3))  # Slow down frame rate to self.max_fps to give GUI time to update
 
 
 class JKamGenDriver(QObject):
@@ -67,7 +68,13 @@ class JKamGenDriver(QObject):
 
     def stop_acquisition(self):
         self.acquiring = False
+        # Request thread interruption first
+        self.frame_grabber.requestInterruption()
         self.frame_grabber.quit()
+        # Wait for the thread to finish with a reasonable timeout
+        if not self.frame_grabber.wait(3000):  # 3 second timeout
+            print("Warning: Frame grabber thread did not terminate cleanly")
+            self.frame_grabber.terminate()
         self._stop_acquisition(self.cam)
         print(f'STOPPED camera acquisition with serial number: {self.serial_number}')
 

@@ -1,5 +1,5 @@
-from PyQt5.QtWidgets import QWidget, QApplication
 from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtWidgets import QWidget, QApplication, QMessageBox
 from package.ui.cameracontrolwidget_ui import Ui_CameraControlWidget
 from package.data import camerasettings
 
@@ -57,7 +57,7 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
             self.software_trigger_pushButton.clicked.connect(self.driver.execute_software_trigger)
             self.driver.frame_captured_signal.connect(self.frame_received_signal.emit)
         elif self.camera_comboBox.currentIndex() == 0:
-            print('Please select imaging system!')
+            QMessageBox.warning(self, 'Warning', 'Please select imaging system!')
             self.driver = None
             self.serial_number = ''
 
@@ -97,8 +97,7 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
                 self.triggered_toggled(True)
             self.armed_signal.emit()
         except Exception as e:
-            print('Error while trying to ARM camera')
-            print(e)
+            QMessageBox.critical(self, 'Error', f'Error while trying to ARM camera: {e}')
             self.abort()
 
     def disarm(self, aborting=False):
@@ -108,8 +107,7 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
                     self.stop()
                 self.driver.disarm_camera()
             except Exception as e:
-                print('Error while trying to DISARM camera')
-                print(e)
+                QMessageBox.critical(self, 'Error', f'Error while trying to DISARM camera: {e}')
                 self.abort()
         self.armed = False
         self.arm_pushButton.setChecked(False)
@@ -143,8 +141,7 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
                 self.software_trigger_pushButton.setEnabled(True)
             self.started_signal.emit()
         except Exception as e:
-            print('Error while trying to START video')
-            print(e)
+            QMessageBox.critical(self, 'Error', f'Error while trying to START video: {e}')
             self.abort()
 
     def stop(self, aborting=False):
@@ -152,8 +149,7 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
             try:
                 self.driver.stop_acquisition()
             except Exception as e:
-                print('Error while trying to STOP video')
-                print(e)
+                QMessageBox.critical(self, 'Error', f'Error while trying to STOP video: {e}')
                 self.abort()
         self.start_pushButton.setText('Start Camera')
 
@@ -200,20 +196,35 @@ class CameraControlWidget(QWidget, Ui_CameraControlWidget):
             self.driver.set_software_trigger()
 
     def exposure_edited(self):
-        self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFAAAA;}")
+        # Use theme-aware colors
+        window = self.window()
+        if window and hasattr(window, 'dark_mode') and window.dark_mode:
+            self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #8B0000;}")
+        else:
+            self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFAAAA;}")
 
     def update_exposure(self):
         exposure_input = self.exposure_lineEdit.text()
         try:
             self.exposure_time = round(float(exposure_input), 2)
         except ValueError:
-            print(f'{exposure_input} invalid input for exposure time')
+            QMessageBox.warning(self, 'Warning', f'{exposure_input} invalid input for exposure time')
             self.exposure_lineEdit.setText(f'{self.exposure_time:.2f}')
-            self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFFFFF;}")
+            # Use theme-aware colors
+            window = self.window()
+            if window and hasattr(window, 'dark_mode') and window.dark_mode:
+                self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #3c3c3c;}")
+            else:
+                self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFFFFF;}")
 
     def set_exposure(self):
         self.driver.set_exposure_time(self.exposure_time)
-        self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFFFFF;}")
+        # Use theme-aware colors
+        window = self.window()
+        if window and hasattr(window, 'dark_mode') and window.dark_mode:
+            self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #3c3c3c;}")
+        else:
+            self.exposure_lineEdit.setStyleSheet("QLineEdit {background-color: #FFFFFF;}")
 
     def abort(self):
         self.stop(aborting=True)

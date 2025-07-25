@@ -85,6 +85,22 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QPushButton" name="multishot_update_pushButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>60</width>
+            <height>16777215</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>Update</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </item>
      </layout>

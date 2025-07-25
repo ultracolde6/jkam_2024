@@ -68,9 +68,11 @@ class AndorDriver(JKamGenDriver):
         if not self._trigger_enabled:
             self._execute_software_trigger(cam)
         try:
-            _, _ = self.sdk3.wait_buffer(cam, timeout=ATCore.AT_INFINITE)
+            # Use a reasonable timeout instead of infinite to prevent thread deadlock
+            # 5000ms should be sufficient for most acquisition scenarios
+            _, _ = self.sdk3.wait_buffer(cam, timeout=5000)
         except ATCoreException:
-            return
+            return None
         np_arr = self.buf[0:self.config['aoiheight'] * self.config['aoistride']]
         np_d = np_arr.view(dtype='H')
         np_d = np_d.reshape(self.config['aoiheight'], round(np_d.size / self.config['aoiheight']))
@@ -132,18 +134,48 @@ class AndorDriver(JKamGenDriver):
         # self.frame_dict['metadata']['AOITop'] = aoi_top
 
         ################################# New AOI for horizontal tweezers smaller ROI 06/01/2024
-        aoi_width = 1100
-        aoi_height = 80
-        aoi_left = 350
-        aoi_top = 1160
-        self.sdk3.set_int(cam, "AOIWidth", aoi_width)
-        self.sdk3.set_int(cam, "AOIHeight", aoi_height)
-        self.sdk3.set_int(cam, "AOILeft", aoi_left)
-        self.sdk3.set_int(cam, "AOITop", aoi_top)
-        self.frame_dict['metadata']['AOIWidth'] = aoi_width
-        self.frame_dict['metadata']['AOIHeight'] = aoi_height
-        self.frame_dict['metadata']['AOILeft'] = aoi_left
-        self.frame_dict['metadata']['AOITop'] = aoi_top
+        # aoi_width = 1100
+        # aoi_height = 80
+        # aoi_left = 350
+        # aoi_top = 1160
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+        ################################# AOI for horizontal tweezers After drift  12/09/2024
+        # aoi_width = 1100
+        # aoi_height = 80
+        # aoi_left = 350
+        # aoi_top = 1130
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+        ################################# AOI for checking beam profile 12/11/2024
+        # aoi_width = 150
+        # aoi_height = 150
+        # aoi_left = 500
+        # aoi_top = 1270
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+
 
         ################################# Test ROI 07/01/2024
         # aoi_width = 1100
@@ -185,6 +217,61 @@ class AndorDriver(JKamGenDriver):
         # self.frame_dict['metadata']['AOIHeight'] = aoi_height
         # self.frame_dict['metadata']['AOILeft'] = aoi_left
         # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+        ###########################################################
+        # aoi_width = 1100
+        # aoi_height = 300
+        # aoi_left = 350
+        # aoi_top = 1100
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+        #########################ROI after moving imaging path, etc. 1-16-25 ###
+        # aoi_width = 1200
+        # aoi_height = 300
+        # aoi_left = 397
+        # aoi_top = 1100
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+        #########################ROI after moving imaging path, etc. 1-30-25 old ###
+        # aoi_width = 1200
+        # aoi_height = 200
+        # aoi_left = 397
+        # aoi_top = 1170
+        # self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        # self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        # self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        # self.sdk3.set_int(cam, "AOITop", aoi_top)
+        # self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        # self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        # self.frame_dict['metadata']['AOILeft'] = aoi_left
+        # self.frame_dict['metadata']['AOITop'] = aoi_top
+
+        ######################### smaller ROI after moving imaging path, etc. 1-30-25 ###
+        aoi_width = 1100
+        aoi_height = 120
+        aoi_left = 397
+        aoi_top = 1153 #1183
+        self.sdk3.set_int(cam, "AOIWidth", aoi_width)
+        self.sdk3.set_int(cam, "AOIHeight", aoi_height)
+        self.sdk3.set_int(cam, "AOILeft", aoi_left)
+        self.sdk3.set_int(cam, "AOITop", aoi_top)
+        self.frame_dict['metadata']['AOIWidth'] = aoi_width
+        self.frame_dict['metadata']['AOIHeight'] = aoi_height
+        self.frame_dict['metadata']['AOILeft'] = aoi_left
+        self.frame_dict['metadata']['AOITop'] = aoi_top
 
         '''
         I believe AOI uses row major format for specifying width, height, left and top.

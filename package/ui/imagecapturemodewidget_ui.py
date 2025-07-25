@@ -52,6 +52,11 @@ class Ui_ImageCaptureModeWidget(object):
         self.multishot_spinBox.setMaximum(20)
         self.multishot_spinBox.setObjectName("multishot_spinBox")
         self.horizontalLayout.addWidget(self.multishot_spinBox)
+        self.multishot_update_pushButton = QtWidgets.QPushButton(self.frame)
+        self.multishot_update_pushButton.setEnabled(False)
+        self.multishot_update_pushButton.setMaximumSize(QtCore.QSize(60, 16777215))
+        self.multishot_update_pushButton.setObjectName("multishot_update_pushButton")
+        self.horizontalLayout.addWidget(self.multishot_update_pushButton)
         self.gridLayout_2.addLayout(self.horizontalLayout, 4, 0, 1, 1)
         self.gridLayout.addWidget(self.frame, 0, 0, 1, 1)
         spacerItem = QtWidgets.QSpacerItem(0, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding)
@@ -70,6 +75,7 @@ class Ui_ImageCaptureModeWidget(object):
         self.video_mode_radioButton.setText(_translate("ImageCaptureModeWidget", "Video"))
         self.fluorescence_mode_radioButton.setText(_translate("ImageCaptureModeWidget", "Fluorescence"))
         self.multishot_mode_radioButton.setText(_translate("ImageCaptureModeWidget", "Multishot"))
+        self.multishot_update_pushButton.setText(_translate("ImageCaptureModeWidget", "Update"))
 
 
 if __name__ == "__main__":

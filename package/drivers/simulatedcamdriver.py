@@ -11,15 +11,15 @@ class TriggerMode(Enum):
 
 
 class SimulatedCameraVideoTriggerer(QThread):
-    def __init__(self, cam, driver, parent=None):
-        super(SimulatedCameraVideoTriggerer, self).__init__(parent=parent)
+    def __init__(self, cam, driver):
+        super(SimulatedCameraVideoTriggerer, self).__init__()
         self.cam = cam
         self.driver = driver
 
     def run(self):
-        while self.driver.acquiring:
+        while self.driver.acquiring and not self.isInterruptionRequested():
             self.cam.trigger()
-            self.wait(20)
+            self.msleep(20)  # Use msleep instead of wait
 
 
 def gaussian_2d(x, y, x0=0, y0=0, sx=1, sy=1, amp=1.0, offset=0):
@@ -36,16 +36,23 @@ class SimulatedCamera(QObject):
 
     def __init__(self, driver):
         super(SimulatedCamera, self).__init__()
-        self.thread = QThread()
-        self.moveToThread(self.thread)
-        self.thread.start()
         self.driver = driver
         self.frame = None
         self.frame_ready = False
+        
+        # Create thread and move to it
+        self.thread = QThread()
+        self.moveToThread(self.thread)
+        self.thread.start()
+        
+        # Connect signals after moving to thread
         self.trigger_signal.connect(self.trigger)
-        self.continuous_triggerer = SimulatedCameraVideoTriggerer(self, self.driver, parent=self)
+        
+        # Create the continuous triggerer without parent to avoid cross-thread issues
+        self.continuous_triggerer = SimulatedCameraVideoTriggerer(self, self.driver)
         self.start_continuous_signal.connect(self.continuous_triggerer.start)
         self.stop_continuous_signal.connect(self.continuous_triggerer.quit)
+        
         self.x_coord_array, self.y_coord_array = np.mgrid[-50:50:100j, -50:50:100j]
         self.exposure_time = 10
 
@@ -59,7 +66,20 @@ class SimulatedCamera(QObject):
         sim_frame[sim_frame > 256] = 256
         self.frame = np.round(sim_frame).astype(int)
         self.frame_ready_signal.emit()
-        self.thread.wait(20)
+        # Remove the thread.wait() call as it's not needed and can cause issues
+
+    def cleanup(self):
+        """Clean up threads properly"""
+        if hasattr(self, 'continuous_triggerer'):
+            self.continuous_triggerer.requestInterruption()
+            self.continuous_triggerer.quit()
+            if not self.continuous_triggerer.wait(1000):
+                self.continuous_triggerer.terminate()
+        
+        if hasattr(self, 'thread'):
+            self.thread.quit()
+            if not self.thread.wait(1000):
+                self.thread.terminate()
 
 
 class SimulatedCamDriver(JKamGenDriver):
@@ -71,7 +91,8 @@ class SimulatedCamDriver(JKamGenDriver):
         print('Connected to Simulated Camera driver')
 
     def _close_connection(self):
-        pass
+        if hasattr(self, 'persistant_cam'):
+            self.persistant_cam.cleanup()
 
     @staticmethod
     def _get_serial_number():
@@ -92,6 +113,12 @@ class SimulatedCamDriver(JKamGenDriver):
     def _stop_acquisition(self, cam):
         self.acquiring = False
         self.cam.stop_continuous_signal.emit()
+        # Properly stop the continuous triggerer thread
+        if hasattr(self.cam, 'continuous_triggerer'):
+            self.cam.continuous_triggerer.requestInterruption()
+            self.cam.continuous_triggerer.quit()
+            if not self.cam.continuous_triggerer.wait(1000):
+                self.cam.continuous_triggerer.terminate()
 
     def _set_exposure_time(self, cam, exposure_time):
         """
