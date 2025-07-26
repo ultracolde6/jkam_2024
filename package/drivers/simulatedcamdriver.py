@@ -144,6 +144,22 @@ class SimulatedCamDriver(JKamGenDriver):
         self.cam.trigger_signal.emit()
 
     def _grab_frame(self, cam):
+        # Check if QApplication exists before creating QEventLoop
+        from PyQt5.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            # No QApplication available, use a simple approach
+            # For simulated camera, we can just return the frame directly
+            if hasattr(self.cam, 'frame') and self.cam.frame is not None:
+                return np.copy(self.cam.frame)
+            else:
+                # Trigger frame generation and return a default frame
+                self.cam.trigger()
+                if hasattr(self.cam, 'frame') and self.cam.frame is not None:
+                    return np.copy(self.cam.frame)
+                else:
+                    return None
+        
+        # QApplication exists, use the original QEventLoop approach
         loop = QEventLoop()
         self.cam.frame_ready_signal.connect(loop.quit)
         loop.exec_()

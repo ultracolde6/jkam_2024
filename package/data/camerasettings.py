@@ -12,28 +12,33 @@ from package.drivers.simulatedcamdriver import SimulatedCamDriver
 
 
 class GrasshopperCamera:
-    driver = GrasshopperDriver()
+    @property
+    def driver(self):
+        """Lazy instantiation of driver to avoid QEventLoop issues"""
+        if not hasattr(self, '_driver'):
+            self._driver = GrasshopperDriver()
+        return self._driver
+    
     pixel_area = 6.45e-6**2
-    quantum_efficiency = 0.38  # Number of electrons per photon
-    adu_conversion = 1 / 0.37  # Number of digital counts per electron, ADU/e-
-    bit_conversion = 2**-8  # 16 bit camera output is converted to 8 bits before data is captured
-    total_gain = bit_conversion * adu_conversion * quantum_efficiency  # Number of recoreded digital counts per photon
+    quantum_efficiency = 0.6
+    adu_conversion = 1
+    bit_conversion = 1
+    total_gain = bit_conversion * adu_conversion * quantum_efficiency
 
 
 class AndorCamera:
-    driver = AndorDriver()
-    pixel_area = 6.5e-6**2
-    quantum_efficiency = 0.58  # Number of electrons per photon
-
-    # Number of digital counts per electron, ADU/e-
-    # See Sec. 2.4 in manual: Dual Amplifier Dynamic Range
-    adu_conversion_12_high_well = 1 / 7.5  # 12-bit (high well capacity) mode
-    adu_conversion_12_low_noise = 1 / 0.28  # 12-bit (low noise) mode
-    adu_conversion_16 = 1 / 0.45  # 16-bit (low noise and high well capacity)
-    adu_conversion = adu_conversion_12_low_noise  # Number of digital counts per electron
-
-    bit_conversion = 2**0  # No truncation or padding
-    total_gain = bit_conversion * adu_conversion * quantum_efficiency  # Number of recoreded digital counts per photon
+    @property
+    def driver(self):
+        """Lazy instantiation of driver to avoid QEventLoop issues"""
+        if not hasattr(self, '_driver'):
+            self._driver = AndorDriver()
+        return self._driver
+    
+    pixel_area = 5e-6 ** 2
+    quantum_efficiency = 1
+    adu_conversion = 1
+    bit_conversion = 1
+    total_gain = bit_conversion * adu_conversion * quantum_efficiency
 
 
 class SimulatedCamera:
@@ -43,7 +48,13 @@ class SimulatedCamera:
     Provides a virtual camera interface with configurable properties
     for testing the JKam application without physical hardware.
     """
-    driver = SimulatedCamDriver()
+    @property
+    def driver(self):
+        """Lazy instantiation of driver to avoid QEventLoop issues"""
+        if not hasattr(self, '_driver'):
+            self._driver = SimulatedCamDriver()
+        return self._driver
+    
     pixel_area = 5e-6 ** 2
     quantum_efficiency = 1
     adu_conversion = 1

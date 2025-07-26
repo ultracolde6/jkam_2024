@@ -220,6 +220,8 @@ class JKamWindow(QMainWindow, Ui_CameraWindow):
         Called when the first frame in multishot mode is received.
         Triggers saving of the first frame.
         """
+        if self.verify_autosave():  # Only save individual frames during manual saves
+            return
         try:
             self.save_frames_1()
         except OSError as e:
@@ -240,6 +242,8 @@ class JKamWindow(QMainWindow, Ui_CameraWindow):
         Called when the second frame in multishot mode is received.
         Triggers saving of the second frame.
         """
+        if self.verify_autosave():  # Only save individual frames during manual saves
+            return
         try:
             self.save_frames_2()
         except OSError as e:
@@ -260,6 +264,8 @@ class JKamWindow(QMainWindow, Ui_CameraWindow):
         Called when the third frame in multishot mode is received.
         Triggers saving of the third frame.
         """
+        if self.verify_autosave():  # Only save individual frames during manual saves
+            return
         try:
             self.save_frames_3()
         except OSError as e:

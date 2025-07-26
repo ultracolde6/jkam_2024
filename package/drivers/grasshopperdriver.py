@@ -86,7 +86,16 @@ class GrasshopperDriver(JKamGenDriver):
             image_result.Release()
             return frame
         except PySpin.SpinnakerException:
-            QMessageBox.critical(None, "Error", "Failed to grab frame from camera.")
+            # Check if QApplication exists before showing message box
+            try:
+                from PyQt5.QtWidgets import QApplication
+                if QApplication.instance() is not None:
+                    QMessageBox.critical(None, "Error", "Failed to grab frame from camera.")
+                else:
+                    print("Error: Failed to grab frame from camera.")
+            except ImportError:
+                print("Error: Failed to grab frame from camera.")
+            return None
 
     @staticmethod
     def _load_default_settings(cam):
