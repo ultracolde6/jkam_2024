@@ -86,9 +86,9 @@ class FitVisualizationWindow(QWidget):
     def setupUi(self):
         self.resize(800, 800)
         self.gridLayout = QGridLayout(self)
-        self.pgGraphicsLayout = pg.GraphicsLayoutWidget(parent=self)
+        self.pgGraphicsLayout = pg.GraphicsLayoutWidget()  # Remove parent parameter
         self.pgGraphicsLayout.show()
-        self.text_display_verticalLayout = QVBoxLayout(self)
+        self.text_display_verticalLayout = QVBoxLayout()
         self.gridLayout.addWidget(self.pgGraphicsLayout, 0, 0, 1, 1)
         self.gridLayout.addLayout(self.text_display_verticalLayout, 0, 1, 1, 1)
 
